@@ -100,8 +100,8 @@ impl CostFunction for ZetaGammaLMinusT {
         // Once we understand where the results difference comes from, we'll get back
         // to caching the results
         for (s, _c_s) in (2..=(self.l - 1)).rev().zip(&self.cached_c) {
-            let k = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
-            let c = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
+            let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
+            let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
 
             // Don't use the cached products until we figure out what the problem is
             //   let t_s: f64 = (c_s / f).powf(2.0 / (3.0 + 2.0 * (s as f64)));
@@ -121,6 +121,7 @@ impl CostFunction for ZetaGammaLMinusT {
 
 fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) ->
         Result<Histogram, ()> {
+    // Sort the array so that placing the values in bins becomes easier
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     
     // This can only fail if x is empty or the result contains NaNs.
@@ -128,7 +129,13 @@ fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: 
     let x_min0 = x.first().unwrap();
     let x_max0 = x.last().unwrap();
     let delta0 = x_max0 - x_min0;
-    
+
+    // TODO: remove when we publish the crate
+    for x_i in x.iter() {
+        assert!(x_i >= x_min0);
+        assert!(x_i <= x_max0);
+    }
+
     let x_min = match lim_low {
         Some(value) => value,
         None => x_min0 - delta0 * 0.1
