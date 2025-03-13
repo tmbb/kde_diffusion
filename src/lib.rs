@@ -168,10 +168,15 @@ fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: 
     Ok(result)
 }
 
+/// Evaluated the KDE for a 1D distribution from a vector of observations.
+/// Requires a suggested grid size and optional upper or lower limits.
+///
+/// If the limits are not given, they will be evaluated from the data.
 pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Option<f64>)) ->
           Result<Kde1DResult, ()> {
     // Round up the `grid_size` to the next power of two, masking the old value.
     let grid_size = (2_i32.pow((suggested_grid_size as f64).log2().ceil() as u32)) as usize;
+    // This is the same as variable `N` from the python implementation
     let n_datapoints = x.len(); 
     
     let (lim_low, lim_high) = limits;
@@ -206,11 +211,14 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
     // Convert the transformed vector into an array to facilitate numerical operations
     let transformed: Array1<f64> = transformed.into();
 
+    // Create the function such that the root is the optimal t_star which we will use
+    // to evaluated the kernel bandwidth.
     let fixed_point = ZetaGammaLMinusT::new(&k2, &transformed, n_datapoints, 7_i32);
 
-    let init_param: f64 = 0.0;
+    // Initial parameter for the root-finding algorithm (this is almost arbitrary)
+    let init_param: f64 = 0.05;
+    // Find the root with the Brent algorithm (which doesn't require derivative information)
     let solver = BrentRoot::new(0.0, 0.1, 2e-12);
-
     let result: OptimizationResult<_, _, _> =
         Executor::new(fixed_point, solver)
         .configure(|state| state.param(init_param).max_iters(100))
@@ -218,10 +226,6 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
         .unwrap();
 
     let t_star: f64 = result.state.get_best_param().copied().unwrap_or(init_param);
-    // The Python value for the solution
-    // let t_star: f64 = 0.0007052721991214095;
-
-    println!("t_star: {:?}", t_star);
 
     let mut smoothed: Array1<f64> = transformed * (- 0.5 * PI.powi(2) * t_star * &k2).exp();
     
@@ -309,7 +313,8 @@ mod tests {
         let limits = (Some(x_min), Some(x_max));
         let kde_result: Kde1DResult = kde_1d(x.to_vec(), grid_size, limits).unwrap();
       
-        // Invert the formula for the bandwidth so that we can display it
+        // Invert the formula for the bandwidth to get the t_star from the root
+        // finding algorithm, to see how different it is from the reference implementation
         let calculated_t_star = (kde_result.bandwidth / (x_max - x_min)).powi(2);
         let reference_t_star = (reference_bandwidth / (x_max - x_min)).powi(2);
         
