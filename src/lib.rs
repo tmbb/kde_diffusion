@@ -305,6 +305,7 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::f64::consts::PI;
 
     // Enable reading reference data from the python package
     // (numbers must be read as an `Array0`)
@@ -316,6 +317,10 @@ mod tests {
     use plotly::{Plot, Scatter, Layout};
     use plotly::common::{Anchor, Mode, Font};
     use plotly::layout::Annotation;
+    // Random distributions to reproduce the tests from Botev et al.
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+    use rand_distr::{Normal, Distribution};
 
     use super::*;
 
@@ -419,5 +424,329 @@ mod tests {
         plot.set_layout(layout);
 
         plot.write_html("test/plots/kde1py_reference.html");
+    }
+
+    const BOTEV_SEED: u64 = 31415;
+    const BOTEV_GRID_SIZE: usize = 2048;
+
+    #[derive(Clone)]
+    struct MixtureOfNormals {
+        parameters: Vec<(f64, (f64, f64))>,
+        weights: Vec<f64>,
+        distributions: Vec<Normal<f64>>
+    }
+
+    impl MixtureOfNormals {
+        fn new(parameters: Vec<(f64, (f64, f64))>) -> Self {
+            let mut distributions = Vec::with_capacity(parameters.len());
+            let mut weights = Vec::with_capacity(parameters.len());
+            
+            for (weight, (mean, std_dev)) in parameters.iter() {
+                weights.push(*weight);
+                distributions.push(Normal::new(*mean, *std_dev).unwrap());
+            }
+
+            Self {
+                parameters: parameters,
+                weights: weights,
+                distributions: distributions
+            }
+        }
+        
+        fn pdf(&self, x: f64) -> f64 {
+            // Sum this expression over the weights and distributions:
+            //
+            //      w * (1 / sqrt(2π σ²)) * exp(-((x - μ)² / (2σ²)))
+            
+            self.parameters
+                .iter()
+                .map(|(w, (mean, std_dev))|
+                    w * (- (x - mean).powi(2) / (2.0 * std_dev.powi(2))).exp() /
+                    (std_dev * (2.0 * PI).sqrt())
+                )
+                .sum()
+        }
+    }
+
+    impl Distribution<f64> for MixtureOfNormals {
+        fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
+            let r: f64 = rng.random();
+            
+            let mut weight: f64 = self.weights[0];
+            let mut i: usize = 0;
+            while r > weight {
+                weight += self.weights[i + 1];
+                i += 1;
+            }
+
+            let normal = self.distributions[i];
+            normal.sample(rng)
+        }
+    }
+
+    fn plot_density(path: &str, title: &str, dist: &MixtureOfNormals, kde_result: Kde1DResult) {
+        let mut plot = Plot::new();
+
+        let actual_density: Vec<f64> = kde_result.grid
+            .clone()
+            .iter()
+            .map(|x| dist.pdf(*x))
+            .collect();
+        
+        let calculated_density_trace =
+            Scatter::new(kde_result.grid.clone(), kde_result.density)
+            .mode(Mode::Lines)
+            .name(format!("{} (calculated density)", title));
+
+        let actual_density_trace =
+            Scatter::new(kde_result.grid, actual_density)
+            .mode(Mode::Lines)
+            .name(format!("{} (actual density)", title));
+
+
+        let layout = Layout::new().title(title);
+
+        plot.add_trace(actual_density_trace);
+        plot.add_trace(calculated_density_trace);
+        plot.set_layout(layout);
+
+        plot.write_html(path);
+    }
+
+    #[test]
+    fn test_botev_01_claw() {
+        let claw = MixtureOfNormals::new(vec![
+            (0.5, (0.0, 1.0)),
+            (0.1, (-1.0, 0.1)),
+            (0.1, (-0.5, 0.1)),
+            (0.1, (0.0, 0.1)),
+            (0.1, (0.5, 0.1)),
+            (0.1, (1.0, 0.1))
+        ]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = claw.clone().sample_iter(&mut rng).take(100_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_01_claw.html",
+            "Claw",
+            &claw,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_02_strongly_skewed() {
+        let strongly_skewed = MixtureOfNormals::new(
+            (0..=7)
+            .map(|k| (1./8., (3. * (2./3. as f64).powi(k) - 1., (2./3. as f64).powi(2*k))))
+            .collect()
+        );
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = strongly_skewed.clone().sample_iter(&mut rng).take(10_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_02_strongly_skewed.html",
+            "Strongly skewed",
+            &strongly_skewed,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_03_kurtotic_unimodal() {
+        let kurtotic_unimodal = MixtureOfNormals::new(vec![
+            (2./3., (0.0, 1.0)),
+            (1./3., (0.0, 0.1))
+        ]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = kurtotic_unimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_03_kurtotic_unimodal.html",
+            "Kurtotic unimodal",
+            &kurtotic_unimodal,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_04_double_claw() {
+        let mut parameters = vec![
+            (49./100., (-1.0, 2./3.)),
+            (49./100., (1.0, 2./3.))
+        ];
+
+        for k in 0..=6 {
+            parameters.push((1./350., ((k as f64 - 3.0) / 2.0, 1./100.)))
+        }
+
+        let double_claw = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = double_claw.clone().sample_iter(&mut rng).take(1_000_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_04_double_claw.html",
+            "Double claw",
+            &double_claw,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_05_discrete_comb() {
+        let mut parameters = vec![];
+
+        for k in 0..=2 {
+            parameters.push((2./7., ((12.*(k as f64) - 15.)/7., 2./7.)))
+        }
+
+        for k in 8..=10 {
+            parameters.push((1./21., (2.*(k as f64)/7., 1./21.)))
+        }
+
+        let discrete_comb = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = discrete_comb.clone().sample_iter(&mut rng).take(100_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_05_discrete_comb.html",
+            "Discrete comb",
+            &discrete_comb,
+            kde_result
+        );
+    }
+    
+    #[test]
+    fn test_botev_06_asymmetric_double_claw() {
+        let mut parameters = vec![];
+
+        for k in 0..=1 {
+            parameters.push((46./100., (2.*(k as f64) - 1., 2./3.)))
+        }
+
+        for k in 1..=3 {
+            parameters.push((1./300., (-(k as f64)/2., 1./100.)))
+        }
+
+        for k in 1..=3 {
+            parameters.push((7./300., ((k as f64)/2., 7./100.)))
+        }
+
+        let asymmetric_double_claw = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = asymmetric_double_claw.clone().sample_iter(&mut rng).take(1_000_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_06_asymmetric_double_claw.html",
+            "Discrete comb",
+            &asymmetric_double_claw,
+            kde_result
+        );
+    }
+    
+    #[test]
+    fn test_botev_07_outlier() {
+        let parameters = vec![
+            (1./10., (0., 1.)),
+            (9./10., (0., 0.1))
+        ];
+
+        let outlier = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = outlier.clone().sample_iter(&mut rng).take(100_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_07_outlier.html",
+            "Outlier",
+            &outlier,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_08_separated_bimodal() {
+        let parameters = vec![
+            (1./2., (-12., 1./2.)),
+            (1./2., (12., 1./2.))
+        ];
+
+        let separated_bimodal = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = separated_bimodal.clone().sample_iter(&mut rng).take(1_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_08_separated_bimodal.html",
+            "Separated bimodal",
+            &separated_bimodal,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_09_skewed_bimodal() {
+        let parameters = vec![
+            (3./4., (0., 1.)),
+            (1./4., (3./2., 1./3.))
+        ];
+
+        let skewed_bimodal = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = skewed_bimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_09_skewed_bimodal.html",
+            "Skewed bimodal",
+            &skewed_bimodal,
+            kde_result
+        );
+    }
+
+    #[test]
+    fn test_botev_10_bimodal() {
+        let parameters = vec![
+            (1./2., (0., 0.1)),
+            (1./2., (5., 1.))
+        ];
+
+        let bimodal = MixtureOfNormals::new(parameters);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
+        let x: Vec<f64> = bimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+
+        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+
+        plot_density(
+            "test/plots/botev_10_bimodal.html",
+            "Bimodal",
+            &bimodal,
+            kde_result
+        );
     }
 }
