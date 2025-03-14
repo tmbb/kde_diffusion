@@ -2,7 +2,7 @@ use std::f64::consts::PI;
 use std::option::Option;
 
 use argmin::{
-    core::{OptimizationResult, CostFunction, Error, Executor, State},
+    core::{OptimizationResult, CostFunction, Executor, State, Error as ArgminError},
     solver::brent::BrentRoot,
 };
 
@@ -10,12 +10,23 @@ use rustdct::DctPlanner;
 
 use ndarray::Array1;
 
-#[derive(Debug)]
+// Struct to handle evaluating the root of t - ξγ(t)
 struct ZetaGammaLMinusT {
+    // Cached square indices
     k2: Array1<f64>,
+    // Cached transformed components of the type II DCT
     a2: Array1<f64>,
+    // Nr of datapoints (not nr of grid points)
     n_datapoints: f64,
+    // The Nr of times the ξ function is applied
     l: i32,
+    // Cached constants that depend only on the iteration index
+    // and do neither depend on the data nor on values from
+    // previous iterations.
+    // The values are cached not only because of performance
+    // (the performance impact would probably be minimal)
+    // but mainly to make it clear which parts of the calculation
+    // depend on the data and which parts don't.
     cached_c: Array1<f64>
 }
 
@@ -43,7 +54,15 @@ fn product_of_first_n_odd_numbers(n: i32) -> f64 {
 
 impl ZetaGammaLMinusT {
     pub fn new(k2: &Array1<f64>, transformed: &Array1<f64>, n_datapoints: usize, l: i32) -> Self {
-        let a2: Array1<f64> = (transformed / 2.0).powi(2);
+        // Unlike the Python implementation, we don't divide by 2.0 here
+        // because we are not applying the same kind of post-processing.
+        // This is due to different normalization operations in the Python
+        // and Rust imiplementations of the discrete cosinde transform.
+        //
+        // NOTE: Thanks to Frank Steffahn (@steffahn) who found out that
+        // a different kind of post-processing was needed through old-fashioned
+        // experimentation (although his suggestion was a bit different).
+        let a2: Array1<f64> = transformed.powi(2);
 
         // Slowly build up the constants we'll need.
         // To make it easier to compare our implementation to the "reference"
@@ -55,7 +74,9 @@ impl ZetaGammaLMinusT {
         //
         // The whole point of this is to cache constants that will be reused
         // in all loops instead of computing them anew in each loop iteration.
-        // It also helps simplify the expressions inside the loop iteration. 
+        // It also helps simplify the expressions inside the loop iteration.
+
+        // This constant is called `K` in the Python code.
         let cached_c1: Array1<f64> =
             (2..=(l - 1))
             .rev()
@@ -63,6 +84,7 @@ impl ZetaGammaLMinusT {
             .collect::<Vec<_>>()
             .into();
 
+        // This constant is called `C` in the Python code.
         let cached_c2: Array1<f64> =
             (2..=(l - 1))
             .rev()
@@ -70,7 +92,7 @@ impl ZetaGammaLMinusT {
             .collect::<Vec<_>>()
             .into();
 
-        // The cached product
+        // The cached product, which is a constant for each iteration
         let cached_c: Array1<f64> = 2.0 * cached_c1 * cached_c2 / (n_datapoints as f64);
 
         Self {
@@ -88,24 +110,37 @@ impl CostFunction for ZetaGammaLMinusT {
     type Param = f64;
     type Output = f64;
 
-    fn cost(&self, t: &Self::Param) -> Result<Self::Output, Error> {
+    fn cost(&self, t: &Self::Param) -> Result<Self::Output, ArgminError> {
+        // While this function cold probably be implemented as a `.fold()`
+        // operating on the index of iteration, we have chosen to implement it
+        // as a mutable variable `f` that is continuously updated in order
+        // to be closer to the original Python implementation.
         let mut f: f64 = 2.0 * PI.powi(2 * self.l) * 
             (&self.k2.powi(self.l) *
              &self.a2 *
-             (- PI.powi(2) * &self.k2 * t.clone()).exp())
+             (- PI.powi(2) * &self.k2 * *t).exp())
             .sum();
         
         // Let's ignore the cached values and calculate them anew in each iteration,
         // so that the expression is more similar than the python reference.
         // Once we understand where the results difference comes from, we'll get back
         // to caching the results
-        for (s, _c_s) in (2..=(self.l - 1)).rev().zip(&self.cached_c) {
-            let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
-            let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
-
-            // Don't use the cached products until we figure out what the problem is
-            //   let t_s: f64 = (c_s / f).powf(2.0 / (3.0 + 2.0 * (s as f64)));
-            let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)));
+        for (s, c_s) in (2..=(self.l - 1)).rev().zip(&self.cached_c) {
+            // The original Python implementation re-evaluates `k` and `c`
+            // on each iteration. While this is not super inefficient, it
+            // hides the fact that these are just constants that only depend
+            // on the index of iteration `s` and not on any of the previous
+            // iterations of the loop (or even on the transformed values)
+            //
+            // The original Python code is equivalent to the following lines:
+            // 
+            //     let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
+            //     let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
+            //     let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)))
+            //
+            // All the constants in the product are encapsulated in the `c_s` value,
+            // which we get from the cached vector, resulting in the following expression:
+            let t_s: f64 = (c_s / f).powf(2.0 / (3.0 + 2.0 * (s as f64)));
             
             f = 2.0 * PI.powi(2 * s) *
                (&self.k2.powi(s) * 
@@ -119,8 +154,7 @@ impl CostFunction for ZetaGammaLMinusT {
     }
 }
 
-fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) ->
-        Result<Histogram, ()> {
+fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) -> Histogram {
     // Sort the array so that placing the values in bins becomes easier
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     
@@ -172,7 +206,7 @@ fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: 
         data_range: x_max - x_min
     };
 
-    Ok(result)
+    result
 }
 
 /// Evaluated the KDE for a 1D distribution from a vector of observations.
@@ -180,7 +214,7 @@ fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: 
 ///
 /// If the limits are not given, they will be evaluated from the data.
 pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Option<f64>)) ->
-          Result<Kde1DResult, ()> {
+          Result<Kde1DResult, ArgminError> {
     // Round up the `grid_size` to the next power of two, masking the old value.
     let grid_size = (2_i32.pow((suggested_grid_size as f64).log2().ceil() as u32)) as usize;
     // This is the same as variable `N` from the python implementation
@@ -196,24 +230,27 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
         .into();
 
     // Bin the data points into equally spaced bins
-    let histogram_result: Histogram = histogram(x, grid_size, lim_low, lim_high)?;
+    let histogram_result: Histogram = histogram(x, grid_size, lim_low, lim_high);
 
     let counts = histogram_result.counts;
     let bins = histogram_result.bins;
     let delta_x = histogram_result.data_range;
 
-    // Apply the DCT
+    // Get the raw density applied at the grid points.
     let mut transformed: Vec<f64> =
         counts
         .iter()
         .map(|count| (*count as f64) / (n_datapoints as f64))
         .collect();
 
-    // Compute type II discrete cosine transform, then adjust first component.
+    // Compute type II discrete cosine transform (DCT), then adjust first component.
     let mut planner: DctPlanner<f64> = DctPlanner::new();
     let dct = planner.plan_dct2(grid_size);
     dct.process_dct2(&mut transformed);
-    // TODO: explain why we have to adjust first component
+
+    // Adjust the first component of the DCT.
+    // I'm not sure what role this plays here, so I'm just copying
+    // the Python implementation.
     transformed[0] /= 2.0;
     // Convert the transformed vector into an array to facilitate numerical operations
     let transformed: Array1<f64> = transformed.into();
@@ -229,24 +266,31 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
     let result: OptimizationResult<_, _, _> =
         Executor::new(fixed_point, solver)
         .configure(|state| state.param(init_param).max_iters(100))
-        .run()
-        .unwrap();
+        // For now, we just bubble up the ArgminError.
+        // TODO: find a better error model for this.
+        .run()?;
 
     let t_star: f64 = result.state.get_best_param().copied().unwrap_or(init_param);
 
+    // Smooth the transformation using the `t_star` as a smoothing parameter.
     let mut smoothed: Array1<f64> = transformed * (- 0.5 * PI.powi(2) * t_star * &k2).exp();
     
     // Reverse transformation after adjusting first component
     smoothed[0] *= 2.0;
+    // Invert the smoothed transformation to get the smoothed grid values.
     let mut inverse = smoothed.to_vec();
+    // The DCT type III is the inverse of the DCT type II.
+    // The Python implementation calls this function the IDCT.
     let idct = planner.plan_dct3(grid_size);
     idct.process_dct3(&mut inverse);
     
-    // Normalize density
-    // TODO: compare with the python implementation, which apppears to use
-    // a different normalization scheme.
+    // Normalize the smoothed density.
+    // Compare with the python implementation, which uses a different
+    // normalization constant. This is due to different implementations
+    // of the DCT in the libraries in both languages.
     let density: Array1<f64> = 2.0 * Array1::from(inverse) / delta_x;
 
+    // Translate the smoothing parameter into a bandwidth.
     let bandwidth = t_star.sqrt() * delta_x;
 
     let kde_1d_result = Kde1DResult{
@@ -266,6 +310,8 @@ mod tests {
     // (numbers must be read as an `Array0`)
     use ndarray::{Array1, Array0};
     use ndarray_npy::NpzReader;
+    // Approximate comparisons between floating point
+    use approx::assert_relative_eq;
     // Enable plots for visual comparison of curves
     use plotly::{Plot, Scatter, Layout};
     use plotly::common::{Anchor, Mode, Font};
@@ -315,18 +361,27 @@ mod tests {
         let x_max: f64 = *x_max_array.get(()).unwrap() as f64;
         let reference_bandwidth: f64 = *reference_bandwidth_array.get(()).unwrap();
 
-        assert_eq!(n, x.len());
-
         let limits = (Some(x_min), Some(x_max));
         let kde_result: Kde1DResult = kde_1d(x.to_vec(), grid_size, limits).unwrap();
+
+        assert_eq!(n, x.len());
+        assert_relative_eq!(reference_bandwidth, kde_result.bandwidth);
+
+        for i in 0..grid_size {
+            assert_relative_eq!(reference_density[i], kde_result.density[i]);
+            assert_relative_eq!(reference_grid[i], kde_result.grid[i])
+        }
       
         // Invert the formula for the bandwidth to get the t_star from the root
         // finding algorithm, to see how different it is from the reference implementation
         let calculated_t_star = (kde_result.bandwidth / (x_max - x_min)).powi(2);
         let reference_t_star = (reference_bandwidth / (x_max - x_min)).powi(2);
         
-        // Plot the data so that it can be visually inspected
+        // Plot the data so that it can be visually inspected.
+        // Note that all automated tests that comapre numbers have been done before.
+        // We only add this to help debug things if anything goes wrong.
         let mut plot = Plot::new();
+
         let calculated_density_trace =
             Scatter::new(kde_result.grid, kde_result.density)
             .mode(Mode::LinesMarkers)
