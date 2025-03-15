@@ -343,7 +343,7 @@ mod tests {
     // Cap the number of items used to build the empirical distribution
     // because the functions that build the empirical distribution are
     // kinda slow for large numbers of items.
-    const KOLMOGOROV_SMIRNOV_MAX_ITEMS: usize = 100;
+    const KOLMOGOROV_SMIRNOV_MAX_ITEMS: usize = 5000;
 
     // A friendly structure to hold the result of the test
     struct TwoSampleKolmogorovSmirnovTest {
@@ -638,39 +638,6 @@ mod tests {
 
         plot.to_inline_html(Some(plot_id))
     }
-
-    fn plot_density(
-                path: &str,
-                title: &str,
-                dist: &MixtureOfNormals,
-                kde_result: Kde1DResult
-            ) {
-        let mut plot = Plot::new();
-
-        let actual_density: Vec<f64> = kde_result.grid
-            .clone()
-            .iter()
-            .map(|x| dist.pdf(*x))
-            .collect();
-
-        let estimated_density_trace =
-            Scatter::new(kde_result.grid.clone(), kde_result.density)
-            .mode(Mode::Lines)
-            .name(format!("{} (estimated density)", title));
-
-        let actual_density_trace =
-            Scatter::new(kde_result.grid, actual_density)
-            .mode(Mode::Lines)
-            .name(format!("{} (actual density)", title));
-
-        let layout = Layout::new().title(title);
-
-        plot.add_trace(actual_density_trace);
-        plot.add_trace(estimated_density_trace);
-        plot.set_layout(layout);
-
-        plot.write_html(path);
-        }
 
     // Compare the density, grid and bandwidth, to the ones in the reference
     macro_rules! assert_equal_to_reference_within_tolerance {
@@ -1042,7 +1009,7 @@ mod tests {
 
         let output = tera.render("test/templates/demo.html", &context).unwrap();
 
-        let mut file = File::create("webpage/demo.html").unwrap();
+        let mut file = File::create("webpage/index.html").unwrap();
         let _ = file.write_all(&output.as_bytes());
     }
 
