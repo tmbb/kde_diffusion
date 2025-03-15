@@ -122,7 +122,7 @@ def reference_for_botev_04_double_claw():
     return reference_for_dist(
         "04_double_claw",
         double_claw,
-        100_000
+        1_000_000
     )
 
 
@@ -151,7 +151,7 @@ def reference_for_botev_06_asymmetric_double_claw():
     return reference_for_dist(
         "06_asymmetric_double_claw",
         asymmetric_double_claw,
-        100_000
+        1_000_000
     )
 
 def reference_for_botev_07_outlier():

@@ -306,6 +306,7 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
 mod tests {
     use std::fs::File;
     use std::f64::consts::PI;
+    use std::io::prelude::*;
 
     // Enable reading reference data from the python package
     // (numbers must be read as an `Array0`)
@@ -326,6 +327,8 @@ mod tests {
     // Kolmogorov-Smirnov test to test whether samples follow
     // the same distribution
     use statrs::distribution::{ContinuousCDF, Empirical};
+    // Build the demo page
+    use tera::{Tera, Context};
 
     use super::*;
 
@@ -336,10 +339,11 @@ mod tests {
 
     // Confidence level for the Kolmogorov-Smirnov test
     const KOLMOGOROV_SMIRNOV_ALPHA: f64 = 0.05;
+
     // Cap the number of items used to build the empirical distribution
     // because the functions that build the empirical distribution are
     // kinda slow for large numbers of items.
-    const KOLMOGOROV_SMIRNOV_MAX_ITEMS: usize = 5000;
+    const KOLMOGOROV_SMIRNOV_MAX_ITEMS: usize = 100;
 
     // A friendly structure to hold the result of the test
     struct TwoSampleKolmogorovSmirnovTest {
@@ -599,12 +603,12 @@ mod tests {
     }
 
     fn plot_density_against_reference(
-                path: &str,
+                plot_id: &str,
                 title: &str,
                 dist: &MixtureOfNormals,
                 kde_result: Kde1DResult,
                 py_ref: PyReferenceData1D
-            ) {
+            ) -> String {
         let mut plot = Plot::new();
 
         let actual_density: Vec<f64> = kde_result.grid
@@ -628,14 +632,11 @@ mod tests {
             .mode(Mode::Lines)
             .name(format!("{} - actual density", title));
 
-        let layout = Layout::new().title(title);
-
         plot.add_trace(actual_density_trace);
         plot.add_trace(reference_density_trace);
         plot.add_trace(estimated_density_trace);
-        plot.set_layout(layout);
 
-        plot.write_html(path);
+        plot.to_inline_html(Some(plot_id))
     }
 
     fn plot_density(
@@ -727,87 +728,33 @@ mod tests {
         kde_1d(py_ref.x.clone(), grid_size, limits).unwrap()
     }
 
-    #[test]
-    fn test_botev_01_claw() {
-        let claw = MixtureOfNormals::new(vec![
+    fn botev_01_claw_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
             (0.5, (0.0, 1.0)),
             (0.1, (-1.0, 0.1)),
             (0.1, (-0.5, 0.1)),
             (0.1, (0.0, 0.1)),
             (0.1, (0.5, 0.1)),
             (0.1, (1.0, 0.1))
-        ]);
-
-        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_01_claw.npz");
-        let kde_result = kde_1d_from_data_in_reference(&py_ref);
-
-        // Compare the density, grid and bandwidth, to the ones in the reference
-        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
-        // Compare the Rust and Python implementation of the distributions
-        assert_kolmogorov_smirnov_does_not_reject_the_null!(claw, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_01_claw.html",
-            "Claw",
-            &claw,
-            kde_result,
-            py_ref
-        );
+        ])
     }
 
-    #[test]
-    fn test_botev_02_strongly_skewed() {
-        let strongly_skewed = MixtureOfNormals::new(
+    fn botev_02_strongly_skewed_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(
             (0..=7)
             .map(|k| (1./8., (3. * ((2./3. as f64).powi(k) - 1.), (2./3. as f64).powi(k))))
             .collect()
-        );
-
-        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_02_strongly_skewed.npz");
-        let kde_result = kde_1d_from_data_in_reference(&py_ref);
-
-        // Compare the density, grid and bandwidth, to the ones in the reference
-        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
-        // Compare the Rust and Python implementation of the distributions
-        assert_kolmogorov_smirnov_does_not_reject_the_null!(strongly_skewed, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_02_strongly_skewed.html",
-            "Strongly skewed",
-            &strongly_skewed,
-            kde_result,
-            py_ref
-        );
+        )
     }
 
-    #[test]
-    fn test_botev_03_kurtotic_unimodal() {
-        let kurtotic_unimodal = MixtureOfNormals::new(vec![
+    fn botev_03_kurtotic_unimodal_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
             (2./3., (0.0, 1.0)),
             (1./3., (0.0, 0.1))
-        ]);
-        
-        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_03_kurtotic_unimodal.npz");
-        let kde_result = kde_1d_from_data_in_reference(&py_ref);
-
-        // Compare the density, grid and bandwidth, to the ones in the reference
-        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
-        // Compare the Rust and Python implementation of the distributions
-        assert_kolmogorov_smirnov_does_not_reject_the_null!(kurtotic_unimodal, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density(
-            "test/plots/botev_03_kurtotic_unimodal.html",
-            "Kurtotic unimodal",
-            &kurtotic_unimodal,
-            kde_result
-        );
+        ])
     }
 
-    #[test]
-    fn test_botev_04_double_claw() {
+    fn botev_04_double_claw_distribution() -> MixtureOfNormals {
         let mut parameters = vec![
             (49./100., (-1.0, 2./3.)),
             (49./100., (1.0, 2./3.))
@@ -817,28 +764,10 @@ mod tests {
             parameters.push((1./350., ((k as f64 - 3.0) / 2.0, 1./100.)))
         }
 
-        let double_claw = MixtureOfNormals::new(parameters);
-
-        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_04_double_claw.npz");
-        let kde_result = kde_1d_from_data_in_reference(&py_ref);
-
-        // Compare the density, grid and bandwidth, to the ones in the reference
-        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
-        // Compare the Rust and Python implementation of the distributions
-        assert_kolmogorov_smirnov_does_not_reject_the_null!(double_claw, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_04_double_claw.html",
-            "Double claw",
-            &double_claw,
-            kde_result,
-            py_ref
-        );
+        MixtureOfNormals::new(parameters)
     }
 
-    #[test]
-    fn test_botev_05_discrete_comb() {
+    fn botev_05_discrete_comb_distribution() -> MixtureOfNormals {
         let mut parameters = vec![];
 
         for k in 0..=2 {
@@ -849,28 +778,10 @@ mod tests {
             parameters.push((1./21., (2.*(k as f64)/7., 1./21.)))
         }
 
-        let discrete_comb = MixtureOfNormals::new(parameters);
-
-        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_05_discrete_comb.npz");
-        let kde_result = kde_1d_from_data_in_reference(&py_ref);
-
-        // Compare the density, grid and bandwidth, to the ones in the reference
-        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
-        // Compare the Rust and Python implementation of the distributions
-        assert_kolmogorov_smirnov_does_not_reject_the_null!(discrete_comb, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_05_discrete_comb.html",
-            "Discrete comb",
-            &discrete_comb,
-            kde_result,
-            py_ref
-        );
+        MixtureOfNormals::new(parameters)
     }
     
-    #[test]
-    fn test_botev_06_asymmetric_double_claw() {
+    fn botev_06_asymmetric_double_claw_distribution() -> MixtureOfNormals {
         let mut parameters = vec![];
 
         for k in 0..=1 {
@@ -885,8 +796,102 @@ mod tests {
             parameters.push((7./300., ((k as f64)/2., 7./100.)))
         }
 
-        let asymmetric_double_claw = MixtureOfNormals::new(parameters);
+        MixtureOfNormals::new(parameters)
+    }
 
+    fn botev_07_outlier_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
+            (1./10., (0., 1.)),
+            (9./10., (0., 0.1))
+        ])
+    }
+    
+    fn botev_08_separated_bimodal_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
+            (1./2., (-12., 1./2.)),
+            (1./2., (12., 1./2.))
+        ])
+    }
+
+    fn botev_09_skewed_bimodal_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
+            (3./4., (0., 1.)),
+            (1./4., (3./2., 1./3.))
+        ])
+    }
+    
+    fn botev_10_bimodal_distribution() -> MixtureOfNormals {
+        MixtureOfNormals::new(vec![
+            (1./2., (0., 0.1)),
+            (1./2., (5., 1.))
+        ])
+    }
+
+    #[test]
+    fn test_botev_01_claw() {
+        let claw = botev_01_claw_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_01_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(claw, py_ref);
+    }
+
+    #[test]
+    fn test_botev_02_strongly_skewed() {
+        let strongly_skewed = botev_02_strongly_skewed_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_02_strongly_skewed.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(strongly_skewed, py_ref);
+    }
+
+    #[test]
+    fn test_botev_03_kurtotic_unimodal() {
+        let kurtotic_unimodal = botev_03_kurtotic_unimodal_distribution();
+        
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_03_kurtotic_unimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(kurtotic_unimodal, py_ref);
+    }
+
+    #[test]
+    fn test_botev_04_double_claw() {
+        let double_claw = botev_04_double_claw_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_04_double_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(double_claw, py_ref);
+    }
+
+    #[test]
+    fn test_botev_05_discrete_comb() {
+        let discrete_comb = botev_05_discrete_comb_distribution();
+
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_05_discrete_comb.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(discrete_comb, py_ref);
+    }
+
+    #[test]
+    fn test_botev_06_asymmetric_double_claw() {
+        let asymmetric_double_claw = botev_06_asymmetric_double_claw_distribution();
         let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_06_asymmetric_double_claw.npz");
         let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
@@ -894,26 +899,11 @@ mod tests {
         assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
         // Compare the Rust and Python implementation of the distributions
         assert_kolmogorov_smirnov_does_not_reject_the_null!(asymmetric_double_claw, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_06_asymmetric_double_claw.html",
-            "Discrete comb",
-            &asymmetric_double_claw,
-            kde_result,
-            py_ref
-        );
     }
-    
+
     #[test]
     fn test_botev_07_outlier() {
-        let parameters = vec![
-            (1./10., (0., 1.)),
-            (9./10., (0., 0.1))
-        ];
-
-        let outlier = MixtureOfNormals::new(parameters);
-
+        let outlier = botev_07_outlier_distribution();
         let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_07_outlier.npz");
         let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
@@ -921,26 +911,11 @@ mod tests {
         assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
         // Compare the Rust and Python implementation of the distributions
         assert_kolmogorov_smirnov_does_not_reject_the_null!(outlier, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_07_outlier.html",
-            "Outlier",
-            &outlier,
-            kde_result,
-            py_ref
-        );
     }
 
     #[test]
     fn test_botev_08_separated_bimodal() {
-        let parameters = vec![
-            (1./2., (-12., 1./2.)),
-            (1./2., (12., 1./2.))
-        ];
-
-        let separated_bimodal = MixtureOfNormals::new(parameters);
-
+        let separated_bimodal = botev_08_separated_bimodal_distribution();
         let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_08_separated_bimodal.npz");
         let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
@@ -948,26 +923,11 @@ mod tests {
         assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
         // Compare the Rust and Python implementation of the distributions
         assert_kolmogorov_smirnov_does_not_reject_the_null!(separated_bimodal, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_08_separated_bimodal.html",
-            "Separated bimodal",
-            &separated_bimodal,
-            kde_result,
-            py_ref
-        );
     }
 
     #[test]
     fn test_botev_09_skewed_bimodal() {
-        let parameters = vec![
-            (3./4., (0., 1.)),
-            (1./4., (3./2., 1./3.))
-        ];
-
-        let skewed_bimodal = MixtureOfNormals::new(parameters);
-
+        let skewed_bimodal = botev_09_skewed_bimodal_distribution();
         let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_09_skewed_bimodal.npz");
         let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
@@ -975,26 +935,11 @@ mod tests {
         assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
         // Compare the Rust and Python implementation of the distributions
         assert_kolmogorov_smirnov_does_not_reject_the_null!(skewed_bimodal, py_ref);
-
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_09_skewed_bimodal.html",
-            "Skewed bimodal",
-            &skewed_bimodal,
-            kde_result,
-            py_ref
-        );
     }
 
     #[test]
     fn test_botev_10_bimodal() {
-        let parameters = vec![
-            (1./2., (0., 0.1)),
-            (1./2., (5., 1.))
-        ];
-
-        let bimodal = MixtureOfNormals::new(parameters);
-
+        let bimodal = botev_10_bimodal_distribution();
         let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_10_bimodal.npz");
         let kde_result = kde_1d_from_data_in_reference(&py_ref);
         
@@ -1002,15 +947,103 @@ mod tests {
         assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
         // Compare the Rust and Python implementation of the distributions
         assert_kolmogorov_smirnov_does_not_reject_the_null!(bimodal, py_ref);
+    }
 
-        // Doesn't perform any actual tests but can be useful for debugging.
-        plot_density_against_reference(
-            "test/plots/botev_10_bimodal.html",
-            "Bimodal",
-            &bimodal,
+    #[test]
+    fn build_demo_page() {
+        let mut tera = Tera::default();
+        tera.add_template_file("test/templates/demo.html", None).unwrap();
+
+        let claw = botev_01_claw_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_01_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_01_claw_plot = plot_density_against_reference(
+            "botev_01_claw_plot", "Claw", &claw, kde_result, py_ref
+        );
+
+        let strongly_skewed = botev_02_strongly_skewed_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_02_strongly_skewed.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_02_strongly_skewed_plot = plot_density_against_reference(
+            "botev_02_strongly_skewed_plot", "Strongly skewed", &strongly_skewed, kde_result, py_ref
+        );
+
+        let kurtotic_unimodal = botev_03_kurtotic_unimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_03_kurtotic_unimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_03_kurtotic_unimodal_plot = plot_density_against_reference(
+            "botev_03_kurtotic_unimodal_plot", "Kurtotic unimodal", &kurtotic_unimodal, kde_result, py_ref
+        );
+
+        let double_claw = botev_04_double_claw_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_04_double_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_04_double_claw_plot = plot_density_against_reference(
+            "botev_04_double_claw_plot", "Double claw", &double_claw, kde_result, py_ref
+        );
+
+        let discrete_comb = botev_05_discrete_comb_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_05_discrete_comb.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_05_discrete_comb_plot = plot_density_against_reference(
+            "botev_05_discrete_comb_plot", "Discrete comb", &discrete_comb, kde_result, py_ref
+        );
+
+        let asymmetric_double_claw = botev_06_asymmetric_double_claw_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_06_asymmetric_double_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_06_asymmetric_double_claw_plot = plot_density_against_reference(
+            "botev_06_asymmetric_double_claw_plot",
+            "Asymmetric double claw",
+            &asymmetric_double_claw,
             kde_result,
             py_ref
         );
+
+        let outlier = botev_07_outlier_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_07_outlier.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_07_outlier_plot = plot_density_against_reference(
+            "botev_07_outlier_plot", "Outlier", &outlier, kde_result, py_ref
+        );
+
+        let separated_bimodal = botev_08_separated_bimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_08_separated_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_08_separated_bimodal_plot = plot_density_against_reference(
+            "botev_08_separated_bimodal_plot", "Separated bimodal", &separated_bimodal, kde_result, py_ref
+        );
+
+        let skewed_bimodal = botev_09_skewed_bimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_09_skewed_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_09_skewed_bimodal_plot = plot_density_against_reference(
+            "botev_09_skewed_bimodal_plot", "Skewed bimodal", &skewed_bimodal, kde_result, py_ref
+        );
+
+        let bimodal = botev_10_bimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_10_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_10_bimodal_plot = plot_density_against_reference(
+            "botev_10_bimodal_plot", "Skewed bimodal", &bimodal, kde_result, py_ref
+        );
+
+        let mut context = Context::new();
+        context.insert("botev_01_claw_plot", &botev_01_claw_plot);
+        context.insert("botev_02_strongly_skewed_plot", &botev_02_strongly_skewed_plot);
+        context.insert("botev_03_kurtotic_unimodal_plot", &botev_03_kurtotic_unimodal_plot);
+        context.insert("botev_04_double_claw_plot", &botev_04_double_claw_plot);
+        context.insert("botev_05_discrete_comb_plot", &botev_05_discrete_comb_plot);
+        context.insert("botev_06_asymmetric_double_claw_plot", &botev_06_asymmetric_double_claw_plot);
+        context.insert("botev_07_outlier_plot", &botev_07_outlier_plot);
+        context.insert("botev_08_separated_bimodal_plot", &botev_08_separated_bimodal_plot);
+        context.insert("botev_09_skewed_bimodal_plot", &botev_09_skewed_bimodal_plot);
+        context.insert("botev_10_bimodal_plot", &botev_10_bimodal_plot);
+
+        let output = tera.render("test/templates/demo.html", &context).unwrap();
+
+        let mut file = File::create("webpage/demo.html").unwrap();
+        let _ = file.write_all(&output.as_bytes());
     }
 
     // TODO: add the remaining test cases from Botev et al 2010
