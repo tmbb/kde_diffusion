@@ -320,12 +320,184 @@ mod tests {
     // Random distributions to reproduce the tests from Botev et al.
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+    // Utilities to help define our custom distributions
     use rand_distr::{Normal, Distribution};
+    // Add support for empirical CDFs so that we can use the
+    // Kolmogorov-Smirnov test to test whether samples follow
+    // the same distribution
+    use statrs::distribution::{ContinuousCDF, Empirical};
 
     use super::*;
 
+    // Random seed for all tests to ensure deterministic output
+    const RNG_SEED: u64 = 31415;
+    // We can't be super strict when comparing floating points
+    const TOLERANCE: f64 = 8.0*f64::EPSILON;
+
+    // Confidence level for the Kolmogorov-Smirnov test
+    const KOLMOGOROV_SMIRNOV_ALPHA: f64 = 0.05;
+    // Cap the number of items used to build the empirical distribution
+    // because the functions that build the empirical distribution are
+    // kinda slow for large numbers of items.
+    const KOLMOGOROV_SMIRNOV_MAX_ITEMS: usize = 5000;
+
+    // A friendly structure to hold the result of the test
+    struct TwoSampleKolmogorovSmirnovTest {
+        statistic: f64,
+        cutoff: f64
+    }
+
+    impl TwoSampleKolmogorovSmirnovTest {
+        fn run(samples_a: &Vec<f64>, samples_b: &Vec<f64>) -> Self {
+            // Cap the number of comapred samples because the empirical distributions
+            // are very slow; they probably implement a linear algorithm that doesn't
+            // scale very well. This won't be a problem if the elements are truly
+            // generated in random order.
+            let n = usize::min(samples_a.len(), KOLMOGOROV_SMIRNOV_MAX_ITEMS);
+            let m = usize::min(samples_b.len(), KOLMOGOROV_SMIRNOV_MAX_ITEMS);
+
+            let samples_a = samples_a.into_iter().map(|x| *x).take(n);
+            let samples_b = samples_b.into_iter().map(|x| *x).take(m);
+
+            let f_a = Empirical::from_iter(samples_a.clone());
+            let f_b = Empirical::from_iter(samples_b.clone());
+
+            let n = n as f64;
+            let m = m as f64;
+
+            let statistic_a = samples_a
+                .clone()
+                .map(|x| (f_a.cdf(x) - f_b.cdf(x)).abs())
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+
+            let statistic_b = samples_b
+                .clone()
+                .map(|x| (f_a.cdf(x) - f_b.cdf(x)).abs())
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+
+            let c_alpha = (- (KOLMOGOROV_SMIRNOV_ALPHA / 2.0).ln() / 2.0).sqrt();
+
+            let cutoff = c_alpha * ((n + m) / (n * m)).sqrt();
+
+            Self {
+                statistic: f64::max(statistic_a, statistic_b),
+                cutoff: cutoff
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct PyReferenceData1D {
+        x: Vec<f64>,
+        n_datapoints: usize,
+        grid_size: usize,
+        x_max: f64,
+        x_min: f64,
+        density: Vec<f64>,
+        grid: Vec<f64>,
+        bandwidth: f64
+    }
+
+    impl PyReferenceData1D {
+        fn from_npz(path: &str) -> Self {
+            let file = File::open(path).unwrap();
+            let mut npz = NpzReader::new(file).unwrap();
+
+            let x: Array1<f64> = npz.by_name("x").unwrap();
+            let density: Array1<f64> = npz.by_name("density").unwrap();
+            let grid: Array1<f64> = npz.by_name("grid").unwrap();
+
+            let n_array: Array0<i64> = npz.by_name("N").unwrap();
+            // Here, `grid_size` is the variable `n` in the original python tests
+            let grid_size_array: Array0<i64> = npz.by_name("n").unwrap();
+            let x_min_array: Array0<f64> = npz.by_name("xmin").unwrap();
+            let x_max_array: Array0<f64> = npz.by_name("xmax").unwrap();
+            let bandwidth_array: Array0<f64> = npz.by_name("bandwidth").unwrap();
+
+            // Convert scalars into the right types
+            let n_datapoints: usize = *n_array.get(()).unwrap() as usize;
+            let grid_size: usize = *grid_size_array.get(()).unwrap() as usize;
+            let x_min: f64 = *x_min_array.get(()).unwrap() as f64;
+            let x_max: f64 = *x_max_array.get(()).unwrap() as f64;
+            let bandwidth: f64 = *bandwidth_array.get(()).unwrap();
+
+            Self {
+                x: x.to_vec(),
+                n_datapoints: n_datapoints,
+                grid_size: grid_size,
+                x_max: x_max,
+                x_min: x_min,
+                density: density.to_vec(),
+                grid: grid.to_vec(),
+                bandwidth: bandwidth
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    // TODO: Generalize this so that we can support mixtures
+    // of other kinds of distributions
+    struct MixtureOfNormals {
+        parameters: Vec<(f64, (f64, f64))>,
+        weights: Vec<f64>,
+        distributions: Vec<Normal<f64>>
+    }
+
+    impl MixtureOfNormals {
+        fn new(parameters: Vec<(f64, (f64, f64))>) -> Self {
+            let mut distributions = Vec::with_capacity(parameters.len());
+            let mut weights = Vec::with_capacity(parameters.len());
+            
+            for (weight, (mean, std_dev)) in parameters.iter() {
+                weights.push(*weight);
+                distributions.push(Normal::new(*mean, *std_dev).unwrap());
+            }
+
+            Self {
+                parameters: parameters,
+                weights: weights,
+                distributions: distributions
+            }
+        }
+        
+        fn pdf(&self, x: f64) -> f64 {
+            // Sum this expression over the weights and distributions:
+            //
+            //      w * (1 / sqrt(2π σ²)) * exp(-((x - μ)² / (2σ²)))
+            
+            self.parameters
+                .iter()
+                .map(|(w, (mean, std_dev))|
+                    w * (- (x - mean).powi(2) / (2.0 * std_dev.powi(2))).exp() /
+                    (std_dev * (2.0 * PI).sqrt())
+                )
+                .sum()
+        }
+    }
+
+    impl Distribution<f64> for MixtureOfNormals {
+        fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
+            let r: f64 = rng.random();
+            
+            let mut weight: f64 = self.weights[0];
+            let mut i: usize = 0;
+            while r > weight {
+                weight += self.weights[i + 1];
+                i += 1;
+            }
+
+            let normal = self.distributions[i];
+            normal.sample(rng)
+        }
+    }
+    
     #[test]
     fn test_against_reference() {
+        // TODO: refactor this test so that it explits the common
+        // functionality to extract data from '.npz' files.
+        //
         // The (long!) first part of this function varuiables saved
         // into the `.npz` file format by numpy.
         // Because Python's type system is much more lax than
@@ -335,7 +507,7 @@ mod tests {
         // there is some value in just reusing the reference files
         // in a reference implementation.
 
-        let file = File::open("test/reference1d.npz").unwrap();
+        let file = File::open("test/reference_densities/reference1d.npz").unwrap();
         let mut npz = NpzReader::new(file).unwrap();
 
         // Extract the (sometimes weirdly typed) variables from the npz file.
@@ -426,65 +598,13 @@ mod tests {
         plot.write_html("test/plots/kde1py_reference.html");
     }
 
-    const BOTEV_SEED: u64 = 31415;
-    const BOTEV_GRID_SIZE: usize = 2048;
-
-    #[derive(Clone)]
-    struct MixtureOfNormals {
-        parameters: Vec<(f64, (f64, f64))>,
-        weights: Vec<f64>,
-        distributions: Vec<Normal<f64>>
-    }
-
-    impl MixtureOfNormals {
-        fn new(parameters: Vec<(f64, (f64, f64))>) -> Self {
-            let mut distributions = Vec::with_capacity(parameters.len());
-            let mut weights = Vec::with_capacity(parameters.len());
-            
-            for (weight, (mean, std_dev)) in parameters.iter() {
-                weights.push(*weight);
-                distributions.push(Normal::new(*mean, *std_dev).unwrap());
-            }
-
-            Self {
-                parameters: parameters,
-                weights: weights,
-                distributions: distributions
-            }
-        }
-        
-        fn pdf(&self, x: f64) -> f64 {
-            // Sum this expression over the weights and distributions:
-            //
-            //      w * (1 / sqrt(2π σ²)) * exp(-((x - μ)² / (2σ²)))
-            
-            self.parameters
-                .iter()
-                .map(|(w, (mean, std_dev))|
-                    w * (- (x - mean).powi(2) / (2.0 * std_dev.powi(2))).exp() /
-                    (std_dev * (2.0 * PI).sqrt())
-                )
-                .sum()
-        }
-    }
-
-    impl Distribution<f64> for MixtureOfNormals {
-        fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
-            let r: f64 = rng.random();
-            
-            let mut weight: f64 = self.weights[0];
-            let mut i: usize = 0;
-            while r > weight {
-                weight += self.weights[i + 1];
-                i += 1;
-            }
-
-            let normal = self.distributions[i];
-            normal.sample(rng)
-        }
-    }
-
-    fn plot_density(path: &str, title: &str, dist: &MixtureOfNormals, kde_result: Kde1DResult) {
+    fn plot_density_against_reference(
+                path: &str,
+                title: &str,
+                dist: &MixtureOfNormals,
+                kde_result: Kde1DResult,
+                py_ref: PyReferenceData1D
+            ) {
         let mut plot = Plot::new();
 
         let actual_density: Vec<f64> = kde_result.grid
@@ -493,24 +613,118 @@ mod tests {
             .map(|x| dist.pdf(*x))
             .collect();
         
-        let calculated_density_trace =
+        let estimated_density_trace =
             Scatter::new(kde_result.grid.clone(), kde_result.density)
             .mode(Mode::Lines)
-            .name(format!("{} (calculated density)", title));
+            .name(format!("{} - estimated density (.rs)", title));
+
+        let reference_density_trace =
+            Scatter::new(py_ref.grid, py_ref.density)
+            .mode(Mode::Lines)
+            .name(format!("{} - reference density (.py)", title));
+
+        let actual_density_trace =
+            Scatter::new(kde_result.grid, actual_density)
+            .mode(Mode::Lines)
+            .name(format!("{} - actual density", title));
+
+        let layout = Layout::new().title(title);
+
+        plot.add_trace(actual_density_trace);
+        plot.add_trace(reference_density_trace);
+        plot.add_trace(estimated_density_trace);
+        plot.set_layout(layout);
+
+        plot.write_html(path);
+    }
+
+    fn plot_density(
+                path: &str,
+                title: &str,
+                dist: &MixtureOfNormals,
+                kde_result: Kde1DResult
+            ) {
+        let mut plot = Plot::new();
+
+        let actual_density: Vec<f64> = kde_result.grid
+            .clone()
+            .iter()
+            .map(|x| dist.pdf(*x))
+            .collect();
+
+        let estimated_density_trace =
+            Scatter::new(kde_result.grid.clone(), kde_result.density)
+            .mode(Mode::Lines)
+            .name(format!("{} (estimated density)", title));
 
         let actual_density_trace =
             Scatter::new(kde_result.grid, actual_density)
             .mode(Mode::Lines)
             .name(format!("{} (actual density)", title));
 
-
         let layout = Layout::new().title(title);
 
         plot.add_trace(actual_density_trace);
-        plot.add_trace(calculated_density_trace);
+        plot.add_trace(estimated_density_trace);
         plot.set_layout(layout);
 
         plot.write_html(path);
+        }
+
+    // Compare the density, grid and bandwidth, to the ones in the reference
+    macro_rules! assert_equal_to_reference_within_tolerance {
+        ($kde_result:expr, $py_ref:expr) => {
+            {
+                // For the floating point comparisons we use a custom tolerance
+                // value which is slightly less strict than f64::EPSILON to account
+                // for the inevitable small numerical errors that don't have any
+                // practical importance.
+
+                // Basic sanity checks on the reference data:
+                // Check #1: the data length is correct
+                assert_eq!($py_ref.n_datapoints, $py_ref.x.len());
+                // Check #1: the data length is correct
+                assert_eq!($py_ref.grid_size, $py_ref.grid.len());
+
+                // Check the bandwidth against reference
+                assert_relative_eq!($py_ref.bandwidth, $kde_result.bandwidth, epsilon=TOLERANCE);
+
+                for i in 0..$py_ref.grid_size {
+                    // Check the density at grid points against the reference
+                    assert_relative_eq!($py_ref.density[i], $kde_result.density[i], epsilon=TOLERANCE);
+                    // Check the grid points themselves against the reference
+                    assert_relative_eq!($py_ref.grid[i], $kde_result.grid[i], epsilon=TOLERANCE)
+                }
+            }
+        }
+    }
+
+    macro_rules! assert_kolmogorov_smirnov_does_not_reject_the_null {
+        ($dist:expr, $py_ref:expr) => {
+            // Compare the python and rust distributions to ensure they are at least close
+            let mut rng = ChaCha8Rng::seed_from_u64(RNG_SEED);
+            // Generate exactly as many data points as were generated by the python implementation.
+            // This will be a lot of data points, and our implementation of the Kolmogorov-Smirnov
+            // test doesn't deal well with large numbers of datapoints, but we will cap the
+            // number of points we actually use to make things go smoothly.
+            //
+            // TODO: Think about whether it makes sense to compare these distributions
+            // with this test if we will be only comparing ~5000 data points or whether
+            // we should do something else.
+            let rust_x: Vec<f64> = $dist.clone().sample_iter(&mut rng).take($py_ref.n_datapoints).collect();
+            // Run the actual test
+            let ks_test = TwoSampleKolmogorovSmirnovTest::run(&rust_x, &$py_ref.x);
+            // Don't reject the null hypothesis (i.e. show the distributions are not too different)
+            assert!(ks_test.statistic < ks_test.cutoff);
+        }
+    }
+
+    // Build a 1D KDE from the data points, grid size and limits in the reference.
+    fn kde_1d_from_data_in_reference(py_ref: &PyReferenceData1D) -> Kde1DResult{
+        let limits = (Some(py_ref.x_min), Some(py_ref.x_max));
+        let grid_size = py_ref.grid_size;
+        // Clone the x value because we'll be mutating it in place.
+        kde_1d(py_ref.x.clone(), grid_size, limits).unwrap()
     }
 
     #[test]
@@ -524,16 +738,21 @@ mod tests {
             (0.1, (1.0, 0.1))
         ]);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = claw.clone().sample_iter(&mut rng).take(100_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_01_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(claw, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_01_claw.html",
             "Claw",
             &claw,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -541,20 +760,25 @@ mod tests {
     fn test_botev_02_strongly_skewed() {
         let strongly_skewed = MixtureOfNormals::new(
             (0..=7)
-            .map(|k| (1./8., (3. * (2./3. as f64).powi(k) - 1., (2./3. as f64).powi(2*k))))
+            .map(|k| (1./8., (3. * ((2./3. as f64).powi(k) - 1.), (2./3. as f64).powi(k))))
             .collect()
         );
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = strongly_skewed.clone().sample_iter(&mut rng).take(10_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_02_strongly_skewed.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(strongly_skewed, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_02_strongly_skewed.html",
             "Strongly skewed",
             &strongly_skewed,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -564,12 +788,16 @@ mod tests {
             (2./3., (0.0, 1.0)),
             (1./3., (0.0, 0.1))
         ]);
+        
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_03_kurtotic_unimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = kurtotic_unimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(kurtotic_unimodal, py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
-
+        // Doesn't perform any actual tests but can be useful for debugging.
         plot_density(
             "test/plots/botev_03_kurtotic_unimodal.html",
             "Kurtotic unimodal",
@@ -591,16 +819,21 @@ mod tests {
 
         let double_claw = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = double_claw.clone().sample_iter(&mut rng).take(1_000_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_04_double_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(double_claw, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_04_double_claw.html",
             "Double claw",
             &double_claw,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -618,16 +851,21 @@ mod tests {
 
         let discrete_comb = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = discrete_comb.clone().sample_iter(&mut rng).take(100_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_05_discrete_comb.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(discrete_comb, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_05_discrete_comb.html",
             "Discrete comb",
             &discrete_comb,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
     
@@ -649,16 +887,21 @@ mod tests {
 
         let asymmetric_double_claw = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = asymmetric_double_claw.clone().sample_iter(&mut rng).take(1_000_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_06_asymmetric_double_claw.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(asymmetric_double_claw, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_06_asymmetric_double_claw.html",
             "Discrete comb",
             &asymmetric_double_claw,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
     
@@ -671,16 +914,21 @@ mod tests {
 
         let outlier = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = outlier.clone().sample_iter(&mut rng).take(100_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_07_outlier.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(outlier, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_07_outlier.html",
             "Outlier",
             &outlier,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -693,16 +941,21 @@ mod tests {
 
         let separated_bimodal = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = separated_bimodal.clone().sample_iter(&mut rng).take(1_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_08_separated_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(separated_bimodal, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_08_separated_bimodal.html",
             "Separated bimodal",
             &separated_bimodal,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -715,16 +968,21 @@ mod tests {
 
         let skewed_bimodal = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = skewed_bimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_09_skewed_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(skewed_bimodal, py_ref);
 
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_09_skewed_bimodal.html",
             "Skewed bimodal",
             &skewed_bimodal,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
 
@@ -737,16 +995,23 @@ mod tests {
 
         let bimodal = MixtureOfNormals::new(parameters);
 
-        let mut rng = ChaCha8Rng::seed_from_u64(BOTEV_SEED);
-        let x: Vec<f64> = bimodal.clone().sample_iter(&mut rng).take(10_000).collect();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_10_bimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(bimodal, py_ref);
 
-        let kde_result: Kde1DResult = kde_1d(x, BOTEV_GRID_SIZE, (None, None)).unwrap();
-
-        plot_density(
+        // Doesn't perform any actual tests but can be useful for debugging.
+        plot_density_against_reference(
             "test/plots/botev_10_bimodal.html",
             "Bimodal",
             &bimodal,
-            kde_result
+            kde_result,
+            py_ref
         );
     }
+
+    // TODO: add the remaining test cases from Botev et al 2010
 }
