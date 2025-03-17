@@ -136,7 +136,7 @@ impl CostFunction for ZetaGammaLMinusT {
             // 
             //     let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
             //     let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
-            //     let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)))
+            //     let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)));
             //
             // All the constants in the product are encapsulated in the `c_s` value,
             // which we get from the cached vector, resulting in the following expression:
@@ -154,21 +154,57 @@ impl CostFunction for ZetaGammaLMinusT {
     }
 }
 
-fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) -> Histogram {
-    // Sort the array so that placing the values in bins becomes easier
-    x.sort_by(|a, b| a.partial_cmp(b).unwrap());
+fn histogram(x: &Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) -> Histogram {
+    // -------------------
+    // Implementation note
+    // -------------------
+    // The code below seems a bit overcomplicated.
+    // It would be tempting to sort the vector `x` to simplify
+    // the placement of the datapoints on the grid.
+    // Indeed, the first version of this code used to sort the vector first.
+    // This used to have two big disadvantages:
+    //
+    //   1. It used to be very slow. Profiling showed that 90% of the time
+    //      used to be spent sorting the vector
+    //
+    //   2. It required either cloning the vector or taking ownership of the
+    //      vector. Now that we are not sorting anything, we can work with
+    //      just a reference to the vector.
+    
+    // We need to get the maximum and minimum value of the array.
+    // Because equality of floating point values is weird, the easiest way is to implement
+    // the iterator ourselves.
+    let (maybe_x_min0, maybe_x_max0) = x.iter().fold((None, None), |(maybe_x_min, maybe_x_max), x_i| {
+        let x_min = match maybe_x_min {
+            None => Some(*x_i),
+            Some(current_x_min) => {
+                if *x_i < current_x_min {
+                    Some(*x_i)
+                } else {
+                    maybe_x_min
+                }
+            }
+        };
+
+        let x_max = match maybe_x_max {
+            None => Some(*x_i),
+            Some(current_x_max) => {
+                if *x_i > current_x_max {
+                    Some(*x_i)
+                } else {
+                    maybe_x_max
+                }
+            }
+        };
+
+        (x_min, x_max)
+    });
     
     // This can only fail if x is empty or the result contains NaNs.
     // We should deal with that case before these lines.
-    let x_min0 = x.first().unwrap();
-    let x_max0 = x.last().unwrap();
+    let x_min0 = maybe_x_min0.unwrap();
+    let x_max0 = maybe_x_max0.unwrap();
     let delta0 = x_max0 - x_min0;
-
-    // TODO: remove when we publish the crate
-    for x_i in x.iter() {
-        assert!(x_i >= x_min0);
-        assert!(x_i <= x_max0);
-    }
 
     let x_min = match lim_low {
         Some(value) => value,
@@ -180,40 +216,47 @@ fn histogram(mut x: Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: 
         None => x_max0 + delta0 * 0.1
     };
 
-    // Due to the way we build the edges, it's true that `edges.len() == grid_size + 1`
-    let edges: Vec<f64> = Array1::linspace(x_min, x_max, grid_size + 1).to_vec();
-    // TODO: try to convert this into a slice
-    let bins: Vec<f64> = (0..grid_size).map(|i| edges[i]).collect::<Vec<f64>>();
+    let delta = x_max - x_min;
+
+    let bins: Vec<f64> = (0..grid_size)
+        .map(|i| ((i as f64) * delta) / (grid_size as f64) + x_min)
+        .collect::<Vec<f64>>();
     
+    // Absolute counts for the points on the grid
     let mut counts: Vec<u32> = vec![0; grid_size];
 
-    // j is the index for the bin and for the edges
-    let mut j = 0;
-    for x_i in x.iter() {
-        // Increase the bin index until we are in the right bin.
-        // We know we are in the right bin when we are past the relevant left edge. 
-        while *x_i > edges[j + 1] {
-            j += 1
+    // If all values are the same, let's put everything in the middle of the grid
+    if delta == 0.0 {
+        // Put all values in the middle point of the grid
+        counts[((grid_size as f64) / 2.0).floor() as usize] = x.len() as u32;
+    } else {
+        // Otherwise, let's put each datapoint in the correct place on the grid
+
+        // Cache a value that will be useful in the loop iterations:
+        let grid_coefficient: f64 = (grid_size as f64) / delta;
+
+        // Place each datapoint in the right place in the grid
+        for x_i in x.iter() {
+            // Scale everything so that we end up in the right grid point.
+            // Then, take the floor and round it to an integer.
+            let j = (grid_coefficient * (x_i - x_min)).floor() as usize;
+            // Increment the right corresponding count
+            counts[j] += 1
         }
-
-        // Now that we are in the right bin, increase the count for the bin
-        counts[j] += 1
-    }
-
-    let result = Histogram{
-        counts: counts,
-        bins: bins,
-        data_range: x_max - x_min
     };
 
-    result
+    Histogram{
+        counts: counts,
+        bins: bins,
+        data_range: delta
+    }
 }
 
 /// Evaluated the KDE for a 1D distribution from a vector of observations.
 /// Requires a suggested grid size and optional upper or lower limits.
 ///
 /// If the limits are not given, they will be evaluated from the data.
-pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Option<f64>)) ->
+pub fn kde_1d(x: &Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Option<f64>)) ->
           Result<Kde1DResult, ArgminError> {
     // Round up the `grid_size` to the next power of two, masking the old value.
     let grid_size = (2_i32.pow((suggested_grid_size as f64).log2().ceil() as u32)) as usize;
@@ -229,16 +272,19 @@ pub fn kde_1d(x: Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Opt
         .collect::<Vec<f64>>()
         .into();
 
-    // Bin the data points into equally spaced bins
-    let histogram_result: Histogram = histogram(x, grid_size, lim_low, lim_high);
+    // Bin the data points into equally spaced bins.
+    // Profiling shows that for `x.len()` > 10^6 the time to build
+    // the histogram dominates the runtime of this function.
+    // For `x.len()` < 10^5, the time to build the histogram is
+    // less than the time to solve the fixed point equation.
+    let hist: Histogram = histogram(&x, grid_size, lim_low, lim_high);
 
-    let counts = histogram_result.counts;
-    let bins = histogram_result.bins;
-    let delta_x = histogram_result.data_range;
+    let counts = hist.counts;
+    let bins = hist.bins;
+    let delta_x = hist.data_range;
 
     // Get the raw density applied at the grid points.
-    let mut transformed: Vec<f64> =
-        counts
+    let mut transformed: Vec<f64> = counts
         .iter()
         .map(|count| (*count as f64) / (n_datapoints as f64))
         .collect();
@@ -543,7 +589,7 @@ mod tests {
         let reference_bandwidth: f64 = *reference_bandwidth_array.get(()).unwrap();
 
         let limits = (Some(x_min), Some(x_max));
-        let kde_result: Kde1DResult = kde_1d(x.to_vec(), grid_size, limits).unwrap();
+        let kde_result: Kde1DResult = kde_1d(&x.to_vec(), grid_size, limits).unwrap();
 
         assert_eq!(n, x.len());
         assert_relative_eq!(reference_bandwidth, kde_result.bandwidth);
@@ -692,8 +738,10 @@ mod tests {
         let limits = (Some(py_ref.x_min), Some(py_ref.x_max));
         let grid_size = py_ref.grid_size;
         // Clone the x value because we'll be mutating it in place.
-        kde_1d(py_ref.x.clone(), grid_size, limits).unwrap()
+        kde_1d(&py_ref.x.clone(), grid_size, limits).unwrap()
     }
+
+    // Test distributions from the paper by Botev
 
     fn botev_01_claw_distribution() -> MixtureOfNormals {
         MixtureOfNormals::new(vec![
