@@ -203,6 +203,51 @@ def reference_for_botev_10_bimodal():
         100_000
     )
 
+def reference_for_botev_13_trimodal():
+    trimodal = Mixture([
+        (1/3, norm(80*k, (k + 1)**2)) for k in [0, 1, 2]
+    ])
+
+    return reference_for_dist(
+        "13_trimodal",
+        trimodal,
+        100_000
+    )
+
+def reference_for_botev_14_five_modes():
+    five_modes = Mixture([
+        (1/5, norm(80*k, k + 1)) for k in range(0, 4+1)
+    ])
+
+    return reference_for_dist(
+        "14_five_modes",
+        five_modes,
+        100_000
+    )
+
+def reference_for_botev_15_ten_modes():
+    ten_modes = Mixture([
+        (1/10, norm(100*k, k + 1)) for k in range(0, 9+1)
+    ])
+
+    return reference_for_dist(
+        "15_ten_modes",
+        ten_modes,
+        100_000
+    )
+
+def reference_for_botev_16_smooth_comb():
+    ten_modes = Mixture([
+        (2**(5 - k)/63,
+         norm((65 - 96/(2**k))/21, (32/63)/(2**k)))
+        for k in range(0, 5+1)
+    ])
+
+    return reference_for_dist(
+        "16_smooth_comb",
+        ten_modes,
+        100_000
+    )
 
 def main():
     densities = [
@@ -215,7 +260,11 @@ def main():
         reference_for_botev_07_outlier,
         reference_for_botev_08_separated_bimodal,
         reference_for_botev_09_skewed_bimodal,
-        reference_for_botev_10_bimodal
+        reference_for_botev_10_bimodal,
+        reference_for_botev_13_trimodal,
+        reference_for_botev_14_five_modes,
+        reference_for_botev_15_ten_modes,
+        reference_for_botev_16_smooth_comb
     ]
     
     for density in tqdm(densities):

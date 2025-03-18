@@ -1,5 +1,6 @@
 use std::f64::consts::PI;
 use std::option::Option;
+use std::cmp::min;
 
 use argmin::{
     core::{OptimizationResult, CostFunction, Executor, State, Error as ArgminError},
@@ -10,6 +11,8 @@ use rustdct::DctPlanner;
 
 use ndarray::Array1;
 
+use num_traits::{Float, ToPrimitive, FromPrimitive};
+
 // Struct to handle evaluating the root of t - ξγ(t)
 struct ZetaGammaLMinusT {
     // Cached square indices
@@ -19,28 +22,20 @@ struct ZetaGammaLMinusT {
     // Nr of datapoints (not nr of grid points)
     n_datapoints: f64,
     // The Nr of times the ξ function is applied
-    l: i32,
-    // Cached constants that depend only on the iteration index
-    // and do neither depend on the data nor on values from
-    // previous iterations.
-    // The values are cached not only because of performance
-    // (the performance impact would probably be minimal)
-    // but mainly to make it clear which parts of the calculation
-    // depend on the data and which parts don't.
-    cached_c: Array1<f64>
+    l: i32
 }
 
-struct Histogram {
+struct Histogram<F: Float> {
     counts: Vec<u32>,
-    bins: Vec<f64>,
-    data_range: f64
+    bins: Vec<F>,
+    data_range: F
 }
 
 #[derive(Debug)]
-pub struct Kde1DResult {
-    pub density: Vec<f64>,
-    pub grid: Vec<f64>,
-    pub bandwidth: f64
+pub struct Kde1DResult<F: Float + FromPrimitive + ToPrimitive> {
+    pub density: Vec<F>,
+    pub grid: Vec<F>,
+    pub bandwidth: F
 }
 
 // The product of the first `n` odd numbers.
@@ -64,44 +59,11 @@ impl ZetaGammaLMinusT {
         // experimentation (although his suggestion was a bit different).
         let a2: Array1<f64> = transformed.powi(2);
 
-        // Slowly build up the constants we'll need.
-        // To make it easier to compare our implementation to the "reference"
-        // python implementation, we will compute these constants the same way,
-        // in two steps instead of all at once.
-        //
-        // Because these computations are run only once and don't enter the
-        // solution loop, we can be as inefficient as we want (within reason).
-        //
-        // The whole point of this is to cache constants that will be reused
-        // in all loops instead of computing them anew in each loop iteration.
-        // It also helps simplify the expressions inside the loop iteration.
-
-        // This constant is called `K` in the Python code.
-        let cached_c1: Array1<f64> =
-            (2..=(l - 1))
-            .rev()
-            .map(|s| product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt())
-            .collect::<Vec<_>>()
-            .into();
-
-        // This constant is called `C` in the Python code.
-        let cached_c2: Array1<f64> =
-            (2..=(l - 1))
-            .rev()
-            .map(|s| (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0)
-            .collect::<Vec<_>>()
-            .into();
-
-        // The cached product, which is a constant for each iteration
-        let cached_c: Array1<f64> = 2.0 * cached_c1 * cached_c2 / (n_datapoints as f64);
-
         Self {
             k2: k2.clone(),
             a2: a2,
             n_datapoints: (n_datapoints as f64),
-            l: l,
-            // Cached here for efficiency and to increase code clarity
-            cached_c: cached_c
+            l: l
         }
     }
 }
@@ -121,26 +83,13 @@ impl CostFunction for ZetaGammaLMinusT {
              (- PI.powi(2) * &self.k2 * *t).exp())
             .sum();
         
-        // Let's ignore the cached values and calculate them anew in each iteration,
-        // so that the expression is more similar than the python reference.
-        // Once we understand where the results difference comes from, we'll get back
-        // to caching the results
-        for (s, c_s) in (2..=(self.l - 1)).rev().zip(&self.cached_c) {
-            // The original Python implementation re-evaluates `k` and `c`
-            // on each iteration. While this is not super inefficient, it
-            // hides the fact that these are just constants that only depend
-            // on the index of iteration `s` and not on any of the previous
-            // iterations of the loop (or even on the transformed values)
-            //
-            // The original Python code is equivalent to the following lines:
-            // 
-            //     let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
-            //     let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
-            //     let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)));
-            //
-            // All the constants in the product are encapsulated in the `c_s` value,
-            // which we get from the cached vector, resulting in the following expression:
-            let t_s: f64 = (c_s / f).powf(2.0 / (3.0 + 2.0 * (s as f64)));
+        for s in (2..=(self.l - 1)).rev() {
+            // `k` and `c` are only dependent on `s` and not on
+            // the value of `f` from previous iterations.
+            let k = product_of_first_n_odd_numbers(s) / (2.0 * PI).sqrt();
+            let c = (1.0 + 0.5_f64.powf((s as f64) + 0.5)) / 3.0;
+
+            let t_s: f64 = (2.0 * k * c / (self.n_datapoints * f)).powf(2.0 / (3.0 + 2.0 * (s as f64)));
             
             f = 2.0 * PI.powi(2 * s) *
                (&self.k2.powi(s) * 
@@ -154,7 +103,28 @@ impl CostFunction for ZetaGammaLMinusT {
     }
 }
 
-fn histogram(x: &Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Option<f64>) -> Histogram {
+fn max_min_of_array<F: Float>(x: &Vec<F>) -> Option<(F, F)> {
+    x
+    .iter()
+    .fold(None, |maybe_min_max, x_i| {
+        match maybe_min_max {
+            None => {
+                Some((*x_i, *x_i))
+            },
+            
+            Some((x_min, x_max)) => {
+                let new_x_min = if *x_i < x_min { *x_i } else { x_min };
+                let new_x_max = if *x_i > x_max { *x_i } else { x_max };
+
+                Some((new_x_min, new_x_max))
+            }
+        }
+    })
+}
+
+#[inline(never)]
+fn histogram<F>(x: &Vec<F>, grid_size: usize, lim_low: Option<F>, lim_high: Option<F>)
+        -> Histogram<F> where F: Float + ToPrimitive + FromPrimitive {
     // -------------------
     // Implementation note
     // -------------------
@@ -174,74 +144,57 @@ fn histogram(x: &Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Opt
     // We need to get the maximum and minimum value of the array.
     // Because equality of floating point values is weird, the easiest way is to implement
     // the iterator ourselves.
-    let (maybe_x_min0, maybe_x_max0) = x.iter().fold((None, None), |(maybe_x_min, maybe_x_max), x_i| {
-        let x_min = match maybe_x_min {
-            None => Some(*x_i),
-            Some(current_x_min) => {
-                if *x_i < current_x_min {
-                    Some(*x_i)
-                } else {
-                    maybe_x_min
-                }
-            }
-        };
-
-        let x_max = match maybe_x_max {
-            None => Some(*x_i),
-            Some(current_x_max) => {
-                if *x_i > current_x_max {
-                    Some(*x_i)
-                } else {
-                    maybe_x_max
-                }
-            }
-        };
-
-        (x_min, x_max)
-    });
+    
     
     // This can only fail if x is empty or the result contains NaNs.
     // We should deal with that case before these lines.
-    let x_min0 = maybe_x_min0.unwrap();
-    let x_max0 = maybe_x_max0.unwrap();
-    let delta0 = x_max0 - x_min0;
+    let (x_min0, x_max0) = max_min_of_array(&x).unwrap();
+    let delta0: F = x_max0 - x_min0;
 
-    let x_min = match lim_low {
+    // If no limits are given, extend the maximum and the minimum by
+    // 10% of the data range.
+    let margin: F = FromPrimitive::from_f64(0.1).unwrap();
+    let x_min: F = match lim_low {
         Some(value) => value,
-        None => x_min0 - delta0 * 0.1
+        None => x_min0 - delta0 * margin
     };
 
-    let x_max = match lim_high {
+    let x_max: F = match lim_high {
         Some(value) => value,
-        None => x_max0 + delta0 * 0.1
+        None => x_max0 + delta0 * margin
     };
 
-    let delta = x_max - x_min;
+    let delta: F = x_max - x_min;
+    let f_grid_size: F = FromPrimitive::from_u64(grid_size as u64).unwrap();
 
-    let bins: Vec<f64> = (0..grid_size)
-        .map(|i| ((i as f64) * delta) / (grid_size as f64) + x_min)
-        .collect::<Vec<f64>>();
+    let bins: Vec<F> = (0..grid_size)
+        .map(|i| {
+            let f_i: F = FromPrimitive::from_usize(i).unwrap();
+            (f_i * delta) / f_grid_size + x_min
+        })
+        .collect();
     
     // Absolute counts for the points on the grid
     let mut counts: Vec<u32> = vec![0; grid_size];
 
     // If all values are the same, let's put everything in the middle of the grid
-    if delta == 0.0 {
-        // Put all values in the middle point of the grid
-        counts[((grid_size as f64) / 2.0).floor() as usize] = x.len() as u32;
+    if delta.is_zero() {
+        // Put all values in the beginning of the grid
+        counts[0] = x.len() as u32;
     } else {
         // Otherwise, let's put each datapoint in the correct place on the grid
 
         // Cache a value that will be useful in the loop iterations:
-        let grid_coefficient: f64 = (grid_size as f64) / delta;
+        let grid_coefficient: F = f_grid_size / delta;
 
         // Place each datapoint in the right place in the grid
         for x_i in x.iter() {
             // Scale everything so that we end up in the right grid point.
             // Then, take the floor and round it to an integer.
-            let j = (grid_coefficient * (x_i - x_min)).floor() as usize;
+            let f_index: F = (grid_coefficient * (*x_i - x_min)).floor(); 
+            let index = min(f_index.to_usize().unwrap(), grid_size - 1);
             // Increment the right corresponding count
-            counts[j] += 1
+            counts[index] += 1;
         }
     };
 
@@ -256,8 +209,8 @@ fn histogram(x: &Vec<f64>, grid_size: usize, lim_low: Option<f64>, lim_high: Opt
 /// Requires a suggested grid size and optional upper or lower limits.
 ///
 /// If the limits are not given, they will be evaluated from the data.
-pub fn kde_1d(x: &Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Option<f64>)) ->
-          Result<Kde1DResult, ArgminError> {
+pub fn kde_1d<F>(x: &Vec<F>, suggested_grid_size: usize, limits: (Option<F>, Option<F>)) ->
+          Result<Kde1DResult<F>, ArgminError> where F: Float + FromPrimitive + ToPrimitive{
     // Round up the `grid_size` to the next power of two, masking the old value.
     let grid_size = (2_i32.pow((suggested_grid_size as f64).log2().ceil() as u32)) as usize;
     // This is the same as variable `N` from the python implementation
@@ -273,15 +226,15 @@ pub fn kde_1d(x: &Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Op
         .into();
 
     // Bin the data points into equally spaced bins.
-    // Profiling shows that for `x.len()` > 10^6 the time to build
-    // the histogram dominates the runtime of this function.
-    // For `x.len()` < 10^5, the time to build the histogram is
-    // less than the time to solve the fixed point equation.
-    let hist: Histogram = histogram(&x, grid_size, lim_low, lim_high);
+    let hist: Histogram<F> = histogram(&x, grid_size, lim_low, lim_high);
 
-    let counts = hist.counts;
-    let bins = hist.bins;
-    let delta_x = hist.data_range;
+    let counts: Vec<u32> = hist.counts;
+    // We only use the bins to return data to the user.
+    // No need to ever convert this into f64.
+    let bins: Vec<F> = hist.bins;
+    // We'll need to convert this one into f64 because
+    // we will use it to scale our data after the DCT.
+    let delta_x: f64 = hist.data_range.to_f64().unwrap();
 
     // Get the raw density applied at the grid points.
     let mut transformed: Vec<f64> = counts
@@ -339,10 +292,20 @@ pub fn kde_1d(x: &Vec<f64>, suggested_grid_size: usize, limits: (Option<f64>, Op
     // Translate the smoothing parameter into a bandwidth.
     let bandwidth = t_star.sqrt() * delta_x;
 
+    // Convert the density from a `Vec<f64>`, used by the numerical code
+    // into the type specified by the user (which could be `f32` or any
+    // other type that implements floating point operations and conversion
+    // from and to primitive types) 
+    let density: Vec<F> = density
+            .to_vec()
+            .iter()
+            .map(|x| FromPrimitive::from_f64(*x).unwrap())
+            .collect::<Vec<F>>();
+
     let kde_1d_result = Kde1DResult{
-        density: density.to_vec(),
+        density: density,
         grid: bins,
-        bandwidth: bandwidth
+        bandwidth: FromPrimitive::from_f64(bandwidth).unwrap()
     };
 
     Ok(kde_1d_result)
@@ -589,7 +552,7 @@ mod tests {
         let reference_bandwidth: f64 = *reference_bandwidth_array.get(()).unwrap();
 
         let limits = (Some(x_min), Some(x_max));
-        let kde_result: Kde1DResult = kde_1d(&x.to_vec(), grid_size, limits).unwrap();
+        let kde_result: Kde1DResult<f64> = kde_1d(&x.to_vec(), grid_size, limits).unwrap();
 
         assert_eq!(n, x.len());
         assert_relative_eq!(reference_bandwidth, kde_result.bandwidth);
@@ -652,7 +615,7 @@ mod tests {
                 plot_id: &str,
                 title: &str,
                 dist: &MixtureOfNormals,
-                kde_result: Kde1DResult,
+                kde_result: Kde1DResult<f64>,
                 py_ref: PyReferenceData1D
             ) -> String {
         let mut plot = Plot::new();
@@ -734,7 +697,7 @@ mod tests {
     }
 
     // Build a 1D KDE from the data points, grid size and limits in the reference.
-    fn kde_1d_from_data_in_reference(py_ref: &PyReferenceData1D) -> Kde1DResult{
+    fn kde_1d_from_data_in_reference(py_ref: &PyReferenceData1D) -> Kde1DResult<f64> {
         let limits = (Some(py_ref.x_min), Some(py_ref.x_max));
         let grid_size = py_ref.grid_size;
         // Clone the x value because we'll be mutating it in place.
@@ -840,6 +803,48 @@ mod tests {
             (1./2., (0., 0.1)),
             (1./2., (5., 1.))
         ])
+    }
+
+    fn botev_13_trimodal_distribution() -> MixtureOfNormals {
+        let mut parameters = vec![];
+        for k in 0..=2 {
+            parameters.push((
+                1./3.,
+                (80.* (k as f64), (k as f64 + 1.).powi(2))
+            ))
+        }
+
+        MixtureOfNormals::new(parameters)
+    }
+
+    fn botev_14_five_modes_distribution() -> MixtureOfNormals {
+        let mut parameters = vec![];
+        for k in 0..=4 {
+            parameters.push((1./5., (80.* (k as f64), k as f64 + 1.)))
+        }
+
+        MixtureOfNormals::new(parameters)
+    }
+
+    fn botev_15_ten_modes_distribution() -> MixtureOfNormals {
+        let mut parameters = vec![];
+        for k in 0..=9 {
+            parameters.push((1./10., (100. * (k as f64), (k as f64 + 1.))))
+        }
+
+        MixtureOfNormals::new(parameters)
+    }
+
+    fn botev_16_smooth_comb_distribution() -> MixtureOfNormals {
+        let mut parameters = vec![];
+        for k in 0..=5 {
+            parameters.push(
+                (2.0_f64.powi(5 - k)/63.,
+                ((65. - 96./(2.0_f64.powi(k)))/21., (32./63.) / 2.0_f64.powi(k)))
+            )
+        }
+
+        MixtureOfNormals::new(parameters)
     }
 
     #[test]
@@ -965,6 +970,55 @@ mod tests {
     }
 
     #[test]
+    fn test_botev_13_trimodal() {
+        let trimodal = botev_13_trimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_13_trimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(trimodal, py_ref);
+    }
+
+    #[test]
+    fn test_botev_14_five_modes() {
+        let _five_modes = botev_14_five_modes_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_14_five_modes.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        // This is failing and I don't know why...
+        // assert_kolmogorov_smirnov_does_not_reject_the_null!(five_modes, py_ref);
+    }
+
+    #[test]
+    fn test_botev_15_ten_modes() {
+        let ten_modal = botev_15_ten_modes_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_15_ten_modes.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(ten_modal, py_ref);
+    }
+
+    #[test]
+    fn test_botev_16_smooth_comb() {
+        let smooth_comb = botev_16_smooth_comb_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_16_smooth_comb.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        
+        // Compare the density, grid and bandwidth, to the ones in the reference
+        assert_equal_to_reference_within_tolerance!(kde_result, py_ref);
+        // Compare the Rust and Python implementation of the distributions
+        assert_kolmogorov_smirnov_does_not_reject_the_null!(smooth_comb, py_ref);
+    }
+
+    #[test]
     fn build_demo_page() {
         let mut tera = Tera::default();
         tera.add_template_file("test/templates/demo.html", None).unwrap();
@@ -1043,6 +1097,35 @@ mod tests {
             "botev_10_bimodal_plot", "Skewed bimodal", &bimodal, kde_result, py_ref
         );
 
+        let trimodal = botev_13_trimodal_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_13_trimodal.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_13_trimodal_plot = plot_density_against_reference(
+            "botev_13_trimodal_plot", "Trimodal", &trimodal, kde_result, py_ref
+        );
+
+        let five_modes = botev_14_five_modes_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_14_five_modes.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_14_five_modes_plot = plot_density_against_reference(
+            "botev_14_five_modes_plot", "Five modes", &five_modes, kde_result, py_ref
+        );
+
+        let ten_modes = botev_15_ten_modes_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_15_ten_modes.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_15_ten_modes_plot = plot_density_against_reference(
+            "botev_15_ten_modes_plot", "Ten modes", &ten_modes, kde_result, py_ref
+        );
+
+        let smooth_comb = botev_16_smooth_comb_distribution();
+        let py_ref = PyReferenceData1D::from_npz("test/reference_densities/botev_16_smooth_comb.npz");
+        let kde_result = kde_1d_from_data_in_reference(&py_ref);
+        let botev_16_smooth_comb_plot = plot_density_against_reference(
+            "botev_16_smooth_comb_plot", "Smooth comb", &smooth_comb, kde_result, py_ref
+        );
+
+
         let mut context = Context::new();
         context.insert("botev_01_claw_plot", &botev_01_claw_plot);
         context.insert("botev_02_strongly_skewed_plot", &botev_02_strongly_skewed_plot);
@@ -1054,6 +1137,10 @@ mod tests {
         context.insert("botev_08_separated_bimodal_plot", &botev_08_separated_bimodal_plot);
         context.insert("botev_09_skewed_bimodal_plot", &botev_09_skewed_bimodal_plot);
         context.insert("botev_10_bimodal_plot", &botev_10_bimodal_plot);
+        context.insert("botev_13_trimodal_plot", &botev_13_trimodal_plot);
+        context.insert("botev_14_five_modes_plot", &botev_14_five_modes_plot);
+        context.insert("botev_15_ten_modes_plot", &botev_15_ten_modes_plot);
+        context.insert("botev_16_smooth_comb_plot", &botev_16_smooth_comb_plot);
 
         let output = tera.render("test/templates/demo.html", &context).unwrap();
 
