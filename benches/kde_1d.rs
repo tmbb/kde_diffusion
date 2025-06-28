@@ -31,7 +31,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("Double claw");
-    for size in (1..=5).map(|i| i * 20_000 as usize) {
+    for size in (1..=10).map(|i| i * 20_000 as usize) {
         let size_in_k = size / 1000;
         let parameter_string = format!("{:04}k", size_in_k);
         group.throughput(Throughput::Elements(size as u64));

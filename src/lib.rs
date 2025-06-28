@@ -271,11 +271,12 @@ pub fn kde_1d<F>(x: &Vec<F>, suggested_grid_size: usize, limits: (Option<F>, Opt
 
     let t_star: f64 = result.state.get_best_param().copied().unwrap_or(init_param);
 
-    // Smooth the transformation using the `t_star` as a smoothing parameter.
-    let mut smoothed: Array1<f64> = transformed * (- 0.5 * PI.powi(2) * t_star * &k2).exp();
-    
+    let bandwidth = t_star.sqrt() * delta_x;
+
+    let mut smoothed: Array1<f64> =  transformed  * (- 0.5 * PI.powi(2) * t_star * &k2).exp();
     // Reverse transformation after adjusting first component
     smoothed[0] *= 2.0;
+
     // Invert the smoothed transformation to get the smoothed grid values.
     let mut inverse = smoothed.to_vec();
     // The DCT type III is the inverse of the DCT type II.
@@ -289,8 +290,6 @@ pub fn kde_1d<F>(x: &Vec<F>, suggested_grid_size: usize, limits: (Option<F>, Opt
     // of the DCT in the libraries in both languages.
     let density: Array1<f64> = 2.0 * Array1::from(inverse) / delta_x;
 
-    // Translate the smoothing parameter into a bandwidth.
-    let bandwidth = t_star.sqrt() * delta_x;
 
     // Convert the density from a `Vec<f64>`, used by the numerical code
     // into the type specified by the user (which could be `f32` or any
@@ -1018,6 +1017,23 @@ mod tests {
         assert_kolmogorov_smirnov_does_not_reject_the_null!(smooth_comb, py_ref);
     }
 
+    use std::path::Path;
+    use std::{io, fs};
+    
+    fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            } else {
+                fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn build_demo_page() {
         let mut tera = Tera::default();
@@ -1125,7 +1141,6 @@ mod tests {
             "botev_16_smooth_comb_plot", "Smooth comb", &smooth_comb, kde_result, py_ref
         );
 
-
         let mut context = Context::new();
         context.insert("botev_01_claw_plot", &botev_01_claw_plot);
         context.insert("botev_02_strongly_skewed_plot", &botev_02_strongly_skewed_plot);
@@ -1146,6 +1161,12 @@ mod tests {
 
         let mut file = File::create("webpage/index.html").unwrap();
         let _ = file.write_all(&output.as_bytes());
+
+        // Add the benchmarks to the site
+        copy_dir_all(
+            Path::new("target/criterion/Double claw"),
+            Path::new("webpage/benchmarks/double-claw")
+        ).unwrap();
     }
 
     // TODO: add the remaining test cases from Botev et al 2010

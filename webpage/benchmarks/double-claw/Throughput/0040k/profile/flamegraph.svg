@@ -1,0 +1,414 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="406" onload="init(evt)" viewBox="0 0 1200 406" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:"Verdana"; font-size:12px; fill:rgb(0,0,0); }
+#title { text-anchor:middle; font-size:17px; }
+#search { opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+          svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            var el = frames.children;
+            for(var i = 0; i < el.length; i++) {
+                update_text(el[i]);
+            }
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad - 100;
+            matchedtxt.attributes.x.value = svgWidth - xpad - 100;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (/^ *\$/.test(txt) || t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                update_text(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                update_text(e);
+            }
+        }
+    }
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+        update_text(el[i]);
+    }
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="406" fill="url(#background)"/><text id="title" x="50.0000%" y="24.00">Flame Graph</text><text id="details" x="10" y="389.00"> </text><text id="unzoom" class="hide" x="10" y="24.00">Reset Zoom</text><text id="search" x="1090" y="24.00">Search</text><text id="matched" x="1090" y="389.00"> </text><svg id="frames" x="10" width="1180" total_samples="1001"><g><title>&lt;argmin::core::state::iterstate::IterState&lt;P,G,J,H,R,F&gt; as argmin::core::state::State&gt;::func_counts (1 samples, 0.10%)</title><rect x="0.3996%" y="117" width="0.0999%" height="15" fill="rgb(247,98,35)" fg:x="4" fg:w="1"/><text x="0.6496%" y="127.50"></text></g><g><title>__exp2_finite (1 samples, 0.10%)</title><rect x="1.3986%" y="101" width="0.0999%" height="15" fill="rgb(247,138,52)" fg:x="14" fg:w="1"/><text x="1.6486%" y="111.50"></text></g><g><title>__powidf2 (178 samples, 17.78%)</title><rect x="12.9870%" y="85" width="17.7822%" height="15" fill="rgb(213,79,30)" fg:x="130" fg:w="178"/><text x="13.2370%" y="95.50">__powidf2</text></g><g><title>expf32x (424 samples, 42.36%)</title><rect x="30.7692%" y="85" width="42.3576%" height="15" fill="rgb(246,177,23)" fg:x="308" fg:w="424"/><text x="31.0192%" y="95.50">expf32x</text></g><g><title>ndarray::impl_methods::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::map (727 samples, 72.63%)</title><rect x="1.4985%" y="101" width="72.6274%" height="15" fill="rgb(230,62,27)" fg:x="15" fg:w="727"/><text x="1.7485%" y="111.50">ndarray::impl_methods::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::map</text></g><g><title>malloc (10 samples, 1.00%)</title><rect x="73.1269%" y="85" width="0.9990%" height="15" fill="rgb(216,154,8)" fg:x="732" fg:w="10"/><text x="73.3769%" y="95.50"></text></g><g><title>malloc (2 samples, 0.20%)</title><rect x="74.2258%" y="69" width="0.1998%" height="15" fill="rgb(244,35,45)" fg:x="743" fg:w="2"/><text x="74.4758%" y="79.50"></text></g><g><title>ndarray::impl_ops::arithmetic_ops::&lt;impl core::ops::arith::Mul&lt;&amp;ndarray::ArrayBase&lt;S2,E&gt;&gt; for &amp;ndarray::ArrayBase&lt;S,D&gt;&gt;::mul (16 samples, 1.60%)</title><rect x="74.1259%" y="101" width="1.5984%" height="15" fill="rgb(251,115,12)" fg:x="742" fg:w="16"/><text x="74.3759%" y="111.50"></text></g><g><title>ndarray::impl_constructors::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::build_uninit (15 samples, 1.50%)</title><rect x="74.2258%" y="85" width="1.4985%" height="15" fill="rgb(240,54,50)" fg:x="743" fg:w="15"/><text x="74.4758%" y="95.50"></text></g><g><title>ndarray::zip::Zip&lt;(P1,P2,PLast),D&gt;::collect_with_partial (13 samples, 1.30%)</title><rect x="74.4256%" y="69" width="1.2987%" height="15" fill="rgb(233,84,52)" fg:x="745" fg:w="13"/><text x="74.6756%" y="79.50"></text></g><g><title>ndarray::impl_ops::arithmetic_ops::&lt;impl core::ops::arith::Mul&lt;ndarray::ArrayBase&lt;S2,E&gt;&gt; for ndarray::ArrayBase&lt;S,D&gt;&gt;::mul (14 samples, 1.40%)</title><rect x="75.7243%" y="101" width="1.3986%" height="15" fill="rgb(207,117,47)" fg:x="758" fg:w="14"/><text x="75.9743%" y="111.50"></text></g><g><title>free (1 samples, 0.10%)</title><rect x="77.0230%" y="85" width="0.0999%" height="15" fill="rgb(249,43,39)" fg:x="771" fg:w="1"/><text x="77.2730%" y="95.50"></text></g><g><title>ndarray::numeric::impl_numeric::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::sum (10 samples, 1.00%)</title><rect x="77.1229%" y="101" width="0.9990%" height="15" fill="rgb(209,38,44)" fg:x="772" fg:w="10"/><text x="77.3729%" y="111.50"></text></g><g><title>&lt;kde_diffusion::ZetaGammaLMinusT as argmin::core::problem::CostFunction&gt;::cost (779 samples, 77.82%)</title><rect x="0.4995%" y="117" width="77.8222%" height="15" fill="rgb(236,212,23)" fg:x="5" fg:w="779"/><text x="0.7495%" y="127.50">&lt;kde_diffusion::ZetaGammaLMinusT as argmin::core::problem::CostFunction&gt;::cost</text></g><g><title>powf64 (2 samples, 0.20%)</title><rect x="78.1219%" y="101" width="0.1998%" height="15" fill="rgb(242,79,21)" fg:x="782" fg:w="2"/><text x="78.3719%" y="111.50"></text></g><g><title>hashbrown::rustc_entry::&lt;impl hashbrown::map::HashMap&lt;K,V,S,A&gt;&gt;::rustc_entry (2 samples, 0.20%)</title><rect x="78.3217%" y="117" width="0.1998%" height="15" fill="rgb(211,96,35)" fg:x="784" fg:w="2"/><text x="78.5717%" y="127.50"></text></g><g><title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash (1 samples, 0.10%)</title><rect x="78.4216%" y="101" width="0.0999%" height="15" fill="rgb(253,215,40)" fg:x="785" fg:w="1"/><text x="78.6716%" y="111.50"></text></g><g><title>argmin::core::executor::Executor&lt;O,S,I&gt;::run (785 samples, 78.42%)</title><rect x="0.1998%" y="133" width="78.4216%" height="15" fill="rgb(211,81,21)" fg:x="2" fg:w="785"/><text x="0.4498%" y="143.50">argmin::core::executor::Executor&lt;O,S,I&gt;::run</text></g><g><title>std::time::Instant::elapsed (1 samples, 0.10%)</title><rect x="78.5215%" y="117" width="0.0999%" height="15" fill="rgb(208,190,38)" fg:x="786" fg:w="1"/><text x="78.7715%" y="127.50"></text></g><g><title>std::sys::pal::unix::time::Timespec::now (1 samples, 0.10%)</title><rect x="78.5215%" y="101" width="0.0999%" height="15" fill="rgb(235,213,38)" fg:x="786" fg:w="1"/><text x="78.7715%" y="111.50"></text></g><g><title>clock_gettime (1 samples, 0.10%)</title><rect x="78.5215%" y="85" width="0.0999%" height="15" fill="rgb(237,122,38)" fg:x="786" fg:w="1"/><text x="78.7715%" y="95.50"></text></g><g><title>kde_diffusion::ZetaGammaLMinusT::new (3 samples, 0.30%)</title><rect x="78.6214%" y="133" width="0.2997%" height="15" fill="rgb(244,218,35)" fg:x="787" fg:w="3"/><text x="78.8714%" y="143.50"></text></g><g><title>ndarray::impl_methods::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::map (3 samples, 0.30%)</title><rect x="78.6214%" y="117" width="0.2997%" height="15" fill="rgb(240,68,47)" fg:x="787" fg:w="3"/><text x="78.8714%" y="127.50"></text></g><g><title>kde_diffusion::histogram (70 samples, 6.99%)</title><rect x="78.9211%" y="133" width="6.9930%" height="15" fill="rgb(210,16,53)" fg:x="790" fg:w="70"/><text x="79.1711%" y="143.50">kde_diffu..</text></g><g><title>malloc (1 samples, 0.10%)</title><rect x="85.9141%" y="133" width="0.0999%" height="15" fill="rgb(235,124,12)" fg:x="860" fg:w="1"/><text x="86.1641%" y="143.50"></text></g><g><title>ndarray::impl_1d::&lt;impl ndarray::ArrayBase&lt;S,ndarray::dimension::dim::Dim&lt;[usize (2 samples, 0.20%)</title><rect x="86.0140%" y="133" width="0.1998%" height="15" fill="rgb(224,169,11)" fg:x="861" fg:w="2"/><text x="86.2640%" y="143.50"></text></g><g><title> 1]&gt;&gt;&gt;::to_vec (2 samples, 0.20%)</title><rect x="86.0140%" y="117" width="0.1998%" height="15" fill="rgb(250,166,2)" fg:x="861" fg:w="2"/><text x="86.2640%" y="127.50"></text></g><g><title>ndarray::impl_methods::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::map (7 samples, 0.70%)</title><rect x="86.2138%" y="133" width="0.6993%" height="15" fill="rgb(242,216,29)" fg:x="863" fg:w="7"/><text x="86.4638%" y="143.50"></text></g><g><title>expf32x (6 samples, 0.60%)</title><rect x="86.3137%" y="117" width="0.5994%" height="15" fill="rgb(230,116,27)" fg:x="864" fg:w="6"/><text x="86.5637%" y="127.50"></text></g><g><title>ndarray::impl_ops::arithmetic_ops::&lt;impl core::ops::arith::Div&lt;B&gt; for ndarray::ArrayBase&lt;S,D&gt;&gt;::div (2 samples, 0.20%)</title><rect x="86.9131%" y="133" width="0.1998%" height="15" fill="rgb(228,99,48)" fg:x="870" fg:w="2"/><text x="87.1631%" y="143.50"></text></g><g><title>rustdct::Dct2::process_dct2 (1 samples, 0.10%)</title><rect x="87.1129%" y="133" width="0.0999%" height="15" fill="rgb(253,11,6)" fg:x="872" fg:w="1"/><text x="87.3629%" y="143.50"></text></g><g><title>__libc_calloc (1 samples, 0.10%)</title><rect x="87.1129%" y="117" width="0.0999%" height="15" fill="rgb(247,143,39)" fg:x="872" fg:w="1"/><text x="87.3629%" y="127.50"></text></g><g><title>rustdct::Dct3::process_dct3 (5 samples, 0.50%)</title><rect x="87.2128%" y="133" width="0.4995%" height="15" fill="rgb(236,97,10)" fg:x="873" fg:w="5"/><text x="87.4628%" y="143.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (5 samples, 0.50%)</title><rect x="87.2128%" y="117" width="0.4995%" height="15" fill="rgb(233,208,19)" fg:x="873" fg:w="5"/><text x="87.4628%" y="127.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (5 samples, 0.50%)</title><rect x="87.2128%" y="101" width="0.4995%" height="15" fill="rgb(216,164,2)" fg:x="873" fg:w="5"/><text x="87.4628%" y="111.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (5 samples, 0.50%)</title><rect x="87.2128%" y="85" width="0.4995%" height="15" fill="rgb(220,129,5)" fg:x="873" fg:w="5"/><text x="87.4628%" y="95.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (3 samples, 0.30%)</title><rect x="87.4126%" y="69" width="0.2997%" height="15" fill="rgb(242,17,10)" fg:x="875" fg:w="3"/><text x="87.6626%" y="79.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (1 samples, 0.10%)</title><rect x="87.6124%" y="53" width="0.0999%" height="15" fill="rgb(242,107,0)" fg:x="877" fg:w="1"/><text x="87.8624%" y="63.50"></text></g><g><title>rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt;::new (2 samples, 0.20%)</title><rect x="87.7123%" y="117" width="0.1998%" height="15" fill="rgb(251,28,31)" fg:x="878" fg:w="2"/><text x="87.9623%" y="127.50"></text></g><g><title>sincos (2 samples, 0.20%)</title><rect x="87.7123%" y="101" width="0.1998%" height="15" fill="rgb(233,223,10)" fg:x="878" fg:w="2"/><text x="87.9623%" y="111.50"></text></g><g><title>rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt;::new (1 samples, 0.10%)</title><rect x="87.9121%" y="101" width="0.0999%" height="15" fill="rgb(215,21,27)" fg:x="880" fg:w="1"/><text x="88.1621%" y="111.50"></text></g><g><title>malloc (1 samples, 0.10%)</title><rect x="87.9121%" y="85" width="0.0999%" height="15" fill="rgb(232,23,21)" fg:x="880" fg:w="1"/><text x="88.1621%" y="95.50"></text></g><g><title>rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt;::new (2 samples, 0.20%)</title><rect x="88.0120%" y="85" width="0.1998%" height="15" fill="rgb(244,5,23)" fg:x="881" fg:w="2"/><text x="88.2620%" y="95.50"></text></g><g><title>sincos (1 samples, 0.10%)</title><rect x="88.1119%" y="69" width="0.0999%" height="15" fill="rgb(226,81,46)" fg:x="882" fg:w="1"/><text x="88.3619%" y="79.50"></text></g><g><title>rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt;::new (1 samples, 0.10%)</title><rect x="88.2118%" y="69" width="0.0999%" height="15" fill="rgb(247,70,30)" fg:x="883" fg:w="1"/><text x="88.4618%" y="79.50"></text></g><g><title>sincos (1 samples, 0.10%)</title><rect x="88.2118%" y="53" width="0.0999%" height="15" fill="rgb(212,68,19)" fg:x="883" fg:w="1"/><text x="88.4618%" y="63.50"></text></g><g><title>rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt;::new (1 samples, 0.10%)</title><rect x="88.3117%" y="37" width="0.0999%" height="15" fill="rgb(240,187,13)" fg:x="884" fg:w="1"/><text x="88.5617%" y="47.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (886 samples, 88.51%)</title><rect x="0.0000%" y="181" width="88.5115%" height="15" fill="rgb(223,113,26)" fg:x="0" fg:w="886"/><text x="0.2500%" y="191.50">&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter</text></g><g><title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::fold (886 samples, 88.51%)</title><rect x="0.0000%" y="165" width="88.5115%" height="15" fill="rgb(206,192,2)" fg:x="0" fg:w="886"/><text x="0.2500%" y="175.50">&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::fold</text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (886 samples, 88.51%)</title><rect x="0.0000%" y="149" width="88.5115%" height="15" fill="rgb(241,108,4)" fg:x="0" fg:w="886"/><text x="0.2500%" y="159.50">criterion::bencher::Bencher&lt;M&gt;::iter</text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (8 samples, 0.80%)</title><rect x="87.7123%" y="133" width="0.7992%" height="15" fill="rgb(247,173,49)" fg:x="878" fg:w="8"/><text x="87.9623%" y="143.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (6 samples, 0.60%)</title><rect x="87.9121%" y="117" width="0.5994%" height="15" fill="rgb(224,114,35)" fg:x="880" fg:w="6"/><text x="88.1621%" y="127.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (5 samples, 0.50%)</title><rect x="88.0120%" y="101" width="0.4995%" height="15" fill="rgb(245,159,27)" fg:x="881" fg:w="5"/><text x="88.2620%" y="111.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (3 samples, 0.30%)</title><rect x="88.2118%" y="85" width="0.2997%" height="15" fill="rgb(245,172,44)" fg:x="883" fg:w="3"/><text x="88.4618%" y="95.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (2 samples, 0.20%)</title><rect x="88.3117%" y="69" width="0.1998%" height="15" fill="rgb(236,23,11)" fg:x="884" fg:w="2"/><text x="88.5617%" y="79.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (2 samples, 0.20%)</title><rect x="88.3117%" y="53" width="0.1998%" height="15" fill="rgb(205,117,38)" fg:x="884" fg:w="2"/><text x="88.5617%" y="63.50"></text></g><g><title>rustdct::plan::DctPlanner&lt;T&gt;::plan_dct2 (1 samples, 0.10%)</title><rect x="88.4116%" y="37" width="0.0999%" height="15" fill="rgb(237,72,25)" fg:x="885" fg:w="1"/><text x="88.6616%" y="47.50"></text></g><g><title>__powidf2 (13 samples, 1.30%)</title><rect x="89.9101%" y="101" width="1.2987%" height="15" fill="rgb(244,70,9)" fg:x="900" fg:w="13"/><text x="90.1601%" y="111.50"></text></g><g><title>ndarray::impl_methods::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::map (84 samples, 8.39%)</title><rect x="88.7113%" y="117" width="8.3916%" height="15" fill="rgb(217,125,39)" fg:x="888" fg:w="84"/><text x="88.9613%" y="127.50">ndarray::imp..</text></g><g><title>expf32x (59 samples, 5.89%)</title><rect x="91.2088%" y="101" width="5.8941%" height="15" fill="rgb(235,36,10)" fg:x="913" fg:w="59"/><text x="91.4588%" y="111.50">expf32x</text></g><g><title>malloc (2 samples, 0.20%)</title><rect x="97.1029%" y="85" width="0.1998%" height="15" fill="rgb(251,123,47)" fg:x="972" fg:w="2"/><text x="97.3529%" y="95.50"></text></g><g><title>ndarray::impl_ops::arithmetic_ops::&lt;impl core::ops::arith::Mul&lt;&amp;ndarray::ArrayBase&lt;S2,E&gt;&gt; for &amp;ndarray::ArrayBase&lt;S,D&gt;&gt;::mul (5 samples, 0.50%)</title><rect x="97.1029%" y="117" width="0.4995%" height="15" fill="rgb(221,13,13)" fg:x="972" fg:w="5"/><text x="97.3529%" y="127.50"></text></g><g><title>ndarray::impl_constructors::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::build_uninit (5 samples, 0.50%)</title><rect x="97.1029%" y="101" width="0.4995%" height="15" fill="rgb(238,131,9)" fg:x="972" fg:w="5"/><text x="97.3529%" y="111.50"></text></g><g><title>ndarray::zip::Zip&lt;(P1,P2,PLast),D&gt;::collect_with_partial (3 samples, 0.30%)</title><rect x="97.3027%" y="85" width="0.2997%" height="15" fill="rgb(211,50,8)" fg:x="974" fg:w="3"/><text x="97.5527%" y="95.50"></text></g><g><title>ndarray::impl_ops::arithmetic_ops::&lt;impl core::ops::arith::Mul&lt;ndarray::ArrayBase&lt;S2,E&gt;&gt; for ndarray::ArrayBase&lt;S,D&gt;&gt;::mul (5 samples, 0.50%)</title><rect x="97.6024%" y="117" width="0.4995%" height="15" fill="rgb(245,182,24)" fg:x="977" fg:w="5"/><text x="97.8524%" y="127.50"></text></g><g><title>argmin::core::executor::Executor&lt;O,S,I&gt;::run (101 samples, 10.09%)</title><rect x="88.5115%" y="149" width="10.0899%" height="15" fill="rgb(242,14,37)" fg:x="886" fg:w="101"/><text x="88.7615%" y="159.50">argmin::core::e..</text></g><g><title>&lt;kde_diffusion::ZetaGammaLMinusT as argmin::core::problem::CostFunction&gt;::cost (101 samples, 10.09%)</title><rect x="88.5115%" y="133" width="10.0899%" height="15" fill="rgb(246,228,12)" fg:x="886" fg:w="101"/><text x="88.7615%" y="143.50">&lt;kde_diffusion:..</text></g><g><title>ndarray::numeric::impl_numeric::&lt;impl ndarray::ArrayBase&lt;S,D&gt;&gt;::sum (5 samples, 0.50%)</title><rect x="98.1019%" y="117" width="0.4995%" height="15" fill="rgb(213,55,15)" fg:x="982" fg:w="5"/><text x="98.3519%" y="127.50"></text></g><g><title>kde_diffusion::histogram (12 samples, 1.20%)</title><rect x="98.6014%" y="149" width="1.1988%" height="15" fill="rgb(209,9,3)" fg:x="987" fg:w="12"/><text x="98.8514%" y="159.50"></text></g><g><title>rustdct::Dct2::process_dct2 (1 samples, 0.10%)</title><rect x="99.8002%" y="149" width="0.0999%" height="15" fill="rgb(230,59,30)" fg:x="999" fg:w="1"/><text x="100.0502%" y="159.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct2&lt;T&gt;&gt;::process_dct2_with_scratch (1 samples, 0.10%)</title><rect x="99.8002%" y="133" width="0.0999%" height="15" fill="rgb(209,121,21)" fg:x="999" fg:w="1"/><text x="100.0502%" y="143.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct2&lt;T&gt;&gt;::process_dct2_with_scratch (1 samples, 0.10%)</title><rect x="99.8002%" y="117" width="0.0999%" height="15" fill="rgb(220,109,13)" fg:x="999" fg:w="1"/><text x="100.0502%" y="127.50"></text></g><g><title>all (1,001 samples, 100%)</title><rect x="0.0000%" y="357" width="100.0000%" height="15" fill="rgb(232,18,1)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="367.50"></text></g><g><title>kde_1d-71f59804 (1,001 samples, 100.00%)</title><rect x="0.0000%" y="341" width="100.0000%" height="15" fill="rgb(215,41,42)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="351.50">kde_1d-71f59804</text></g><g><title>_start (1,001 samples, 100.00%)</title><rect x="0.0000%" y="325" width="100.0000%" height="15" fill="rgb(224,123,36)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="335.50">_start</text></g><g><title>__libc_start_main (1,001 samples, 100.00%)</title><rect x="0.0000%" y="309" width="100.0000%" height="15" fill="rgb(240,125,3)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="319.50">__libc_start_main</text></g><g><title>main (1,001 samples, 100.00%)</title><rect x="0.0000%" y="293" width="100.0000%" height="15" fill="rgb(205,98,50)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="303.50">main</text></g><g><title>std::rt::lang_start_internal (1,001 samples, 100.00%)</title><rect x="0.0000%" y="277" width="100.0000%" height="15" fill="rgb(205,185,37)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="287.50">std::rt::lang_start_internal</text></g><g><title>std::rt::lang_start::{{closure}} (1,001 samples, 100.00%)</title><rect x="0.0000%" y="261" width="100.0000%" height="15" fill="rgb(238,207,15)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="271.50">std::rt::lang_start::{{closure}}</text></g><g><title>std::sys_common::backtrace::__rust_begin_short_backtrace (1,001 samples, 100.00%)</title><rect x="0.0000%" y="245" width="100.0000%" height="15" fill="rgb(213,199,42)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="255.50">std::sys_common::backtrace::__rust_begin_short_backtrace</text></g><g><title>kde_1d::main (1,001 samples, 100.00%)</title><rect x="0.0000%" y="229" width="100.0000%" height="15" fill="rgb(235,201,11)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="239.50">kde_1d::main</text></g><g><title>kde_1d::criterion_benchmark (1,001 samples, 100.00%)</title><rect x="0.0000%" y="213" width="100.0000%" height="15" fill="rgb(207,46,11)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="223.50">kde_1d::criterion_benchmark</text></g><g><title>criterion::routine::Routine::profile (1,001 samples, 100.00%)</title><rect x="0.0000%" y="197" width="100.0000%" height="15" fill="rgb(241,35,35)" fg:x="0" fg:w="1001"/><text x="0.2500%" y="207.50">criterion::routine::Routine::profile</text></g><g><title>&lt;criterion::routine::Function&lt;M,F,T&gt; as criterion::routine::Routine&lt;M,T&gt;&gt;::warm_up (115 samples, 11.49%)</title><rect x="88.5115%" y="181" width="11.4885%" height="15" fill="rgb(243,32,47)" fg:x="886" fg:w="115"/><text x="88.7615%" y="191.50">&lt;criterion::routi..</text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (115 samples, 11.49%)</title><rect x="88.5115%" y="165" width="11.4885%" height="15" fill="rgb(247,202,23)" fg:x="886" fg:w="115"/><text x="88.7615%" y="175.50">criterion::benche..</text></g><g><title>rustdct::Dct3::process_dct3 (1 samples, 0.10%)</title><rect x="99.9001%" y="149" width="0.0999%" height="15" fill="rgb(219,102,11)" fg:x="1000" fg:w="1"/><text x="100.1501%" y="159.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (1 samples, 0.10%)</title><rect x="99.9001%" y="133" width="0.0999%" height="15" fill="rgb(243,110,44)" fg:x="1000" fg:w="1"/><text x="100.1501%" y="143.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (1 samples, 0.10%)</title><rect x="99.9001%" y="117" width="0.0999%" height="15" fill="rgb(222,74,54)" fg:x="1000" fg:w="1"/><text x="100.1501%" y="127.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_splitradix::Type2And3SplitRadix&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (1 samples, 0.10%)</title><rect x="99.9001%" y="101" width="0.0999%" height="15" fill="rgb(216,99,12)" fg:x="1000" fg:w="1"/><text x="100.1501%" y="111.50"></text></g><g><title>&lt;rustdct::algorithm::type2and3_butterflies::Type2And3Butterfly16&lt;T&gt; as rustdct::Dct3&lt;T&gt;&gt;::process_dct3_with_scratch (1 samples, 0.10%)</title><rect x="99.9001%" y="85" width="0.0999%" height="15" fill="rgb(226,22,26)" fg:x="1000" fg:w="1"/><text x="100.1501%" y="95.50"></text></g></svg></svg>
