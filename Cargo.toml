@@ -6,7 +6,7 @@ license = "MIT"
 description = "KDE using the Botev implementation of the diffusion method"
 homepage = "https://github.com/tmbb/kde_diffusion/"
 repository = "https://github.com/tmbb/kde_diffusion/"
-readme = "readme.md"
+readme = "README.md"
 keywords = ["kde", "statistics"]
 
 [dependencies]
