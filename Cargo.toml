@@ -8,7 +8,7 @@ homepage = "https://github.com/tmbb/kde_diffusion/"
 repository = "https://github.com/tmbb/kde_diffusion/"
 readme = "README.md"
 keywords = ["kde", "statistics"]
-exclude = ["./webpage/**", "./test/**", "./target/**"]
+include = ["/src", "/benches", "/test/reference_densities/*"]
 
 [dependencies]
 argmin = "0.10.0"
